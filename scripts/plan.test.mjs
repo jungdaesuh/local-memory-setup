@@ -738,32 +738,48 @@ test("only installs and rebuilds need Node 22.15; repairs that build nothing do 
     assert.deepEqual(stepsNeedingNewerNode([{ id: "start-qmd" }, { id: "connect-claude" }], "22.12.0"), []);
 });
 
-test("LongMemory uses the reviewed source pin and rebuilds when either source or graph changes", () => {
+test("LongMemory builds the resolved main, with the reviewed lock only for the baseline commit", () => {
     const main = LONGMEMORY_COMMIT;
+    const newer = "0123456789abcdef0123456789abcdef01234567";
     const current = "fedcba9876543210fedcba9876543210fedcba98";
-    const offline = find(planActions(facts(), SAVED), "install-longmemory");
-    assert.equal(offline.alreadyDone, false);
-    assert.match(offline.problem, /pinned LongMemory build or its reviewed dependency graph is missing/);
-    assert.equal(offline.downloadBytes, LONGMEMORY_BUILD_BYTES);
-    assert.match(offline.summary, /pinned LongMemory @/);
+    const first = find(planActions(facts(), SAVED), "install-longmemory");
+    assert.equal(first.alreadyDone, false);
+    assert.equal(first.problem, "LongMemory is not running main @ 9ee2c8e1ed42.");
+    assert.equal(first.downloadBytes, LONGMEMORY_BUILD_BYTES);
+    assert.equal(first.summary, "Build LongMemory main @ 9ee2c8e1ed42 with its reviewed dependency lock. No LongMemory build is running.");
 
     const installed = healthyFacts();
-    const behind = { ...installed, longmemory: { ...installed.longmemory, built: false, current, main, healthy: false } };
+    const behind = { ...installed, longmemory: { ...installed.longmemory, built: true, current, main: newer } };
     const install = find(planActions(behind, SAVED), "install-longmemory");
     assert.equal(install.alreadyDone, false);
-    assert.match(install.summary, /Build pinned LongMemory @ 9ee2c8e1ed42 with its reviewed dependency graph/);
+    assert.equal(
+        install.summary,
+        "Build LongMemory main @ 0123456789ab with a freshly generated dependency lock that must pass npm audit with no high or critical production advisories. The running build is fedcba987654.",
+    );
     assert.equal(install.downloadBytes, LONGMEMORY_BUILD_BYTES);
+    assert.equal(install.blocker, null, "a main newer than the reviewed baseline is never refused");
     const start = find(planActions(behind, SAVED), "start-longmemory");
     assert.equal(start.alreadyDone, false);
-    assert.match(start.problem, /reviewed LongMemory stdio runtime is missing/);
+    assert.match(start.problem, /verified LongMemory stdio runtime is missing/);
     assert.equal(longMemoryRestartPending(behind), true);
 
-    const same = { ...installed, longmemory: { ...installed.longmemory, built: true, current: main, main } };
+    const same = { ...installed, longmemory: { ...installed.longmemory, built: true, current: newer, main: newer } };
     const done = find(planActions(same, SAVED), "install-longmemory");
     assert.equal(done.alreadyDone, true);
-    assert.match(done.summary, /Pinned LongMemory @ 9ee2c8e1ed42 and its reviewed dependency graph are installed/);
+    assert.equal(done.summary, "LongMemory main @ 0123456789ab is the running build.");
     assert.equal(done.downloadBytes, 0);
     assert.equal(find(planActions(same, SAVED), "start-longmemory").alreadyDone, true);
+
+    // The offline check has no resolved main: a verified running build is enough, whichever commit it is.
+    const { main: _unresolved, ...offlineLongMemory } = same.longmemory;
+    const offline = { ...same, longmemory: offlineLongMemory };
+    assert.equal(find(planActions(offline, SAVED), "install-longmemory").alreadyDone, true);
+    assert.equal(longMemoryRestartPending(offline), false);
+    const offlineMissing = { ...offline, longmemory: { ...offlineLongMemory, built: false, current: undefined } };
+    const missing = find(planActions(offlineMissing, SAVED), "install-longmemory");
+    assert.equal(missing.alreadyDone, false);
+    assert.equal(missing.problem, "No verified LongMemory build is current.");
+    assert.equal(longMemoryRestartPending(offlineMissing), true);
 
     const foreign = facts({ longmemory: { built: false, healthy: true, main, envFile: false, dbExists: false } });
     assert.equal(find(planActions(foreign, SAVED), "start-longmemory").alreadyDone, false);

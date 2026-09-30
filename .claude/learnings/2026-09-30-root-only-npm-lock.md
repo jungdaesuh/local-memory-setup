@@ -73,3 +73,22 @@ actually needs it.
   `npm ci`.
 - `scripts/dependency_install.mjs:1` — copies the committed graph and fingerprints the
   exact manifest/lock bytes for build identity.
+
+## Later change: follow latest main with the same derivation
+
+The user then required LongMemory to track the latest `main`. The committed lock stays the
+reviewed graph for `LONGMEMORY_COMMIT`; for any other commit the same derivation runs in
+code (`scripts/longmemory_dependencies.mjs`): upstream root fields and `build` script, direct
+versions from the `pnpm-lock.yaml` root importer, a fresh `npm install --package-lock-only
+--ignore-scripts`, then `npm audit --omit=dev --json`, where high or critical blocks the
+switch. The baseline's exact transitive overrides were not carried forward: each sat
+inside its parents' ranges, so a fresh resolution already selects it or newer, and pinning
+it would hold transitive packages back. A test proves the code derivation reproduces the
+committed manifest (minus overrides) from the baseline commit. The lock only exists after
+checkout, so a newer commit is checked out in a hidden staging directory and renamed to the
+build directory its fingerprint names before `npm ci`.
+
+Reusable rule: when a hand-reviewed dependency derivation must be repeated for future
+upstream revisions, encode it as a function, prove it reproduces the reviewed artifact
+from the reviewed revision, and gate the fresh output on the same audit that justified
+the original.

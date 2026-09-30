@@ -39,7 +39,7 @@ const AGENT_LABELS = { claude: "Claude Code", codex: "Codex", grok: "Grok", open
  * documents without vectors, qmd.nativeAbi/longmemory.nativeAbi/nodeAbi unless the native
  * module or the setup's Node was found, instructions before detection has looked (tests),
  * longmemory.envFile/envModel/dbExists before detection has
- * looked (tests), longmemory.main is the pinned source commit,
+ * looked (tests), longmemory.main unless detection resolved refs/heads/main,
  * longmemory.current unless a finished build is current,
  * longmemory.storedMemories unless the database was counted,
  * longmemory.memoryCountUnknown unless a database exists that could not be counted,
@@ -371,32 +371,49 @@ export function isLongMemoryAction(id) {
 }
 
 /**
- * Native LongMemory is current only when the reviewed build and launcher are ready and
+ * Native LongMemory is current only when a verified build (main, when resolved) and the launcher are ready and
  * no legacy listener can continue exposing the shared database over unauthenticated HTTP.
  * @param {Facts} facts
  */
 export function longMemoryRestartPending(facts) {
+    const { built, current, main } = facts.longmemory;
     const unmanagedHttp = facts.longmemory.healthy && !facts.services.longmemory;
     const foreignRegistration = (facts.foreignServices ?? []).includes("longmemory");
-    const staleBuild = !facts.longmemory.built || facts.longmemory.current !== (facts.longmemory.main ?? LONGMEMORY_COMMIT);
+    // Without a resolved main (the offline check), being behind main is not a problem.
+    const staleBuild = !built || (main !== undefined && current !== main);
     return facts.nativeRuntime !== true || staleBuild || facts.services.longmemory || unmanagedHttp || foreignRegistration;
 }
 
 /**
- * Build the reviewed source commit and dependency graph when the current stamp differs.
+ * Build the resolved main when it is not the running build. The reviewed baseline commit
+ * uses the committed lockfile; any other commit a freshly generated one that must pass the
+ * production audit gate. Without a resolved main, only whether a verified build runs counts.
  * @param {Facts} facts
  */
 function longMemoryInstallAction(facts) {
-    const { built, current } = facts.longmemory;
-    const main = facts.longmemory.main ?? LONGMEMORY_COMMIT;
+    const { built, main, current } = facts.longmemory;
+    if (main === undefined) {
+        return action({
+            id: "install-longmemory",
+            summary: "Download and build LongMemory, a memory server your AI agents save to and recall from.",
+            downloadBytes: built ? 0 : LONGMEMORY_BUILD_BYTES,
+            alreadyDone: built,
+            problem: "No verified LongMemory build is current.",
+        });
+    }
     const short = shortSha(main);
     const differs = !built || current !== main;
+    const running = current === undefined ? "No LongMemory build is running." : `The running build is ${shortSha(current)}.`;
+    const graph =
+        main === LONGMEMORY_COMMIT
+            ? "its reviewed dependency lock"
+            : "a freshly generated dependency lock that must pass npm audit with no high or critical production advisories";
     return action({
         id: "install-longmemory",
-        summary: differs ? `Build pinned LongMemory @ ${short} with its reviewed dependency graph.` : `Pinned LongMemory @ ${short} and its reviewed dependency graph are installed.`,
+        summary: differs ? `Build LongMemory main @ ${short} with ${graph}. ${running}` : `LongMemory main @ ${short} is the running build.`,
         downloadBytes: differs ? LONGMEMORY_BUILD_BYTES : 0,
         alreadyDone: !differs,
-        problem: `The pinned LongMemory build or its reviewed dependency graph is missing (${short}).`,
+        problem: `LongMemory is not running main @ ${short}.`,
     });
 }
 
@@ -412,15 +429,15 @@ function longMemoryServerAction(facts) {
     return action({
         id: "start-longmemory",
         summary: facts.services.longmemory
-            ? "Retire this setup's old LongMemory HTTP service; agents will launch the reviewed server over stdio."
-            : "Prepare reviewed LongMemory for private stdio connections from agents.",
+            ? "Retire this setup's old LongMemory HTTP service; agents will launch the verified LongMemory build over stdio."
+            : "Prepare the verified LongMemory build for private stdio connections from agents.",
         alreadyDone: !pending,
         blocker: foreignRegistration
             ? "An unmarked service registration occupies this setup's LongMemory service name. Resolve it manually before migrating to stdio."
             : unmanagedHttp
               ? "A LongMemory HTTP server is answering outside this setup's managed service. Stop that listener before migrating memory access to stdio."
               : null,
-        problem: "The reviewed LongMemory stdio runtime is missing or the setup's old HTTP service is still registered.",
+        problem: "The verified LongMemory stdio runtime is missing or the setup's old HTTP service is still registered.",
     });
 }
 

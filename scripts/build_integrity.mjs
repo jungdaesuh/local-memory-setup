@@ -8,7 +8,7 @@ const BUILD_INPUTS = ["package.json", "package-lock.json", "tsconfig.json", "src
 const OMITTED_DIRECTORY_NAMES = new Set([".git", ".cache", "logs"]);
 
 /**
- * Hash pinned source and generated output plus npm's resolved graph receipt.
+ * Hash the checked-out source and generated output plus npm's resolved graph receipt.
  * File contents are streamed; the generated LongMemory stamp is excluded.
  * @param {string} buildDir
  * @returns {string} SHA-256 of sorted artifact paths, types, modes, links, and bytes
