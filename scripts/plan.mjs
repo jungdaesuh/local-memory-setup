@@ -1,0 +1,802 @@
+/**
+ * Install plan: a pure function of detected facts (detect.mjs) and the user's
+ * choices. `--plan` prints it, `--apply` executes the pending actions of the same
+ * plan, and `--check` reports the pending actions of the saved choices as problems.
+ *
+ * Monotonic by construction: an existing QMD, Ollama, or server the skill did not set
+ * up is adopted or left alone, never replaced; a conflict it cannot resolve becomes a
+ * `blocker` that stops apply before any change.
+ */
+import path from "node:path";
+import { LONGMEMORY_COMMIT, MIN_NODE, OLLAMA_VERSION, QMD_COMPATIBLE_VERSIONS, QMD_VERSION, ollamaAdminCommand } from "./layout.mjs";
+import { nodeAtLeast } from "./platform.mjs";
+import { MODEL_TIERS, QMD_DEFAULT_MODELS, TIER_IDS, recommendTier } from "./model_choice.mjs";
+import { grokInstructionMode } from "./agent_instructions.mjs";
+import { ollamaHasModel, ollamaServicePlan } from "./ollama_plan.mjs";
+import { LONGMEMORY_BUILD_BYTES, OLLAMA_MODEL_BYTES, OLLAMA_ROCM_BYTES, QMD_MODEL_BYTES, QMD_PACKAGE_BYTES, ollamaInstallerBytes } from "./sizes.mjs";
+
+export const SCHEMA_VERSION = 1;
+
+/** @typedef {"claude" | "codex" | "grok" | "opencode"} AgentId */
+export const AGENT_IDS = /** @type {readonly AgentId[]} */ (["claude", "codex", "grok", "opencode"]);
+const AGENT_LABELS = { claude: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode" };
+
+/**
+ * @typedef {import("./model_choice.mjs").ModelTier} ModelTier
+ * @typedef {import("./qmd_state.mjs").QmdModels} QmdModels
+ * @typedef {{
+ *   schemaVersion: number,
+ *   modelTier: ModelTier,
+ *   agents: AgentId[],
+ *   bootMode: "boot" | "login" | null,
+ *   qmdFolders: string[],
+ * }} Choices
+ *
+ * Optional facts are absent when the thing they describe does not exist:
+ * qmd.configModels without an index.yml `models` block, qmd.foreignCommand unless a
+ * `qmd` outside this setup is first on PATH, qmd.unembeddedFolders unless a collection has
+ * documents without vectors, qmd.nativeAbi/longmemory.nativeAbi/nodeAbi unless the native
+ * module or the setup's Node was found, instructions before detection has looked (tests),
+ * longmemory.envFile/envModel/dbExists before detection has
+ * looked (tests), longmemory.storedMemories unless the database was counted,
+ * longmemory.memoryCountUnknown unless a database exists that could not be counted,
+ * staleServices unless one of the setup's own services runs an out-of-date runner,
+ * withoutSystemd unless Linux runs without systemd as PID 1, selfLingerAllowed unless
+ * polkit lets an active user enable linger.
+ * services.<name> is true when the service is the setup's own registration (unit, agent,
+ * or task), whether or not its runner is current.
+ * @typedef {{
+ *   platform: "linux" | "darwin" | "win32",
+ *   arch: string,
+ *   nodeVersion: string,
+ *   username: string,
+ *   hardware: import("./model_choice.mjs").Hardware,
+ *   disk: { path: string, freeBytes: number }[],
+ *   sudoNonInteractive: boolean,
+ *   lingerEnabled: boolean,
+ *   selfLingerAllowed?: boolean,
+ *   withoutSystemd?: boolean,
+ *   staleServices?: ("qmd" | "longmemory" | "ollama")[],
+ *   brewAvailable: boolean,
+ *   agents: Record<AgentId, { installed: boolean, qmd: boolean, longmemory: boolean }>,
+ *   nodeAbi?: string,
+ *   qmd: {
+ *     version: string | null, healthy: boolean, collectionPaths: string[], configModels?: QmdModels, foreignCommand?: string,
+ *     unembeddedFolders?: string[], embeddingUnknown?: boolean, embeddingUnchecked?: boolean, nativeAbi?: string, installedBySetup?: boolean,
+ *     packageDir?: string,
+ *     modelCache?: { cached: string[], unknown: string[] },
+ *   },
+ *   longmemory: { built: boolean, healthy: boolean, envFile?: boolean, envModel?: string, dbExists?: boolean, storedMemories?: number, memoryCountUnknown?: boolean, nativeAbi?: string },
+ *   instructions?: {
+ *     shared: boolean, claudeRules: boolean, claudeRulesExists: boolean, claudeRulesSeenByGrok: boolean,
+ *     grokCompatRules: boolean | "unsupported", grokImportsClaudeRules: boolean, grokExtraDir: boolean, grokEditable: boolean,
+ *     codexBlock: boolean, opencodeListed: boolean,
+ *   },
+ *   ollama: {
+ *     installed: boolean, healthy: boolean, models: string[],
+ *     systemUnit: { loaded: boolean, enabled: boolean, active: boolean },
+ *     ollamaApp: boolean, brewService: boolean,
+ *   },
+ *   services: { qmd: boolean, longmemory: boolean, ollama: boolean },
+ *   settingsWritten: boolean,
+ *   agentProblems?: Partial<Record<AgentId, string>>,
+ *   saved: unknown,
+ *   notesDir: string | null,
+ *   notesPath?: string,
+ * }} Facts ollama.models holds the model names from GET /api/tags; saved is choices.json as parsed.
+ *
+ * @typedef {{
+ *   id: string, summary: string, needsAdmin: boolean, adminCommand: string | null,
+ *   downloadBytes: number, alreadyDone: boolean, blocker: string | null, problem: string,
+ * }} Action
+ */
+
+const GB = 1_000_000_000;
+function aboutGb(bytes) {
+    return `about ${(bytes / GB).toFixed(bytes < GB ? 2 : 1)} GB`;
+}
+
+/* ------------------------------------------------------------ choices */
+
+/**
+ * Structural problems of a choices document.
+ * @param {unknown} input
+ * @param {{ os: string, agents: readonly string[], bootModes: readonly string[] }} allowed
+ */
+function choiceProblems(input, allowed) {
+    if (typeof input !== "object" || input === null || Array.isArray(input)) return ["Choices must be a JSON object."];
+    const doc = /** @type {Record<string, unknown>} */ (input);
+    const keys = ["schemaVersion", "modelTier", "agents", "bootMode", "qmdFolders"];
+    const problems = [];
+    for (const key of Object.keys(doc)) if (!keys.includes(key)) problems.push(`Unknown key "${key}".`);
+    for (const key of keys) if (!Object.hasOwn(doc, key)) problems.push(`Missing key "${key}".`);
+    if (Object.hasOwn(doc, "schemaVersion") && doc.schemaVersion !== SCHEMA_VERSION) problems.push(`schemaVersion must be ${SCHEMA_VERSION}.`);
+    if (Object.hasOwn(doc, "modelTier") && !TIER_IDS.includes(/** @type {ModelTier} */ (doc.modelTier))) {
+        problems.push(`modelTier must be one of ${TIER_IDS.join(", ")}.`);
+    }
+    if (Object.hasOwn(doc, "agents")) {
+        if (!Array.isArray(doc.agents)) problems.push("agents must be an array.");
+        else {
+            for (const agent of doc.agents) {
+                if (!allowed.agents.includes(agent)) problems.push(`agents: "${String(agent)}" is not an installed agent (${allowed.agents.join(", ") || "none detected"}).`);
+            }
+            if (new Set(doc.agents).size !== doc.agents.length) problems.push("agents lists an agent twice.");
+        }
+    }
+    if (Object.hasOwn(doc, "bootMode")) {
+        if (allowed.bootModes.length === 0) {
+            if (doc.bootMode !== null) problems.push("bootMode must be null on this platform.");
+        } else if (!allowed.bootModes.includes(/** @type {string} */ (doc.bootMode))) {
+            problems.push(`bootMode must be one of ${allowed.bootModes.join(", ")}.`);
+        }
+    }
+    if (Object.hasOwn(doc, "qmdFolders")) {
+        const isAbsolute = allowed.os === "win32" ? path.win32.isAbsolute : path.posix.isAbsolute;
+        if (!Array.isArray(doc.qmdFolders)) problems.push("qmdFolders must be an array.");
+        else {
+            for (const folder of doc.qmdFolders) {
+                if (typeof folder !== "string" || !isAbsolute(folder)) problems.push(`qmdFolders: ${JSON.stringify(folder)} is not an absolute path.`);
+            }
+            if (new Set(doc.qmdFolders).size !== doc.qmdFolders.length) problems.push("qmdFolders lists a folder twice.");
+        }
+    }
+    return problems;
+}
+
+/**
+ * The saved choices (choices.json, written after a successful apply), checked for
+ * structure, with agents that are no longer installed left out. Null when never saved.
+ * @param {Facts} facts
+ * @returns {Choices | null}
+ */
+export function savedChoices(facts) {
+    if (facts.saved === null) return null;
+    const problems = choiceProblems(facts.saved, { os: facts.platform, agents: AGENT_IDS, bootModes: facts.platform === "linux" ? ["boot", "login"] : [] });
+    if (problems.length > 0) throw new Error(`Saved choices (~/.config/local-memory-setup/choices.json) are invalid; fix or delete the file:\n- ${problems.join("\n- ")}`);
+    const saved = /** @type {Choices} */ (facts.saved);
+    return { ...saved, agents: saved.agents.filter((id) => facts.agents[id].installed) };
+}
+
+/**
+ * Tiers compatible with memories LongMemory already stores: its database holds vectors
+ * from the model in its settings file. Null while it stores none. LongMemory creates and
+ * migrates the database file when it starts (src/stores/sqlite/sqlite_store.ts), so the
+ * file alone says nothing; the stored memory rows do. A database that could not be counted
+ * locks, to fail closed. The QMD half of a tier needs no lock: QMD's index.yml decides it.
+ * @param {Facts} facts
+ * @returns {ModelTier[] | null}
+ */
+export function lockedTiers(facts) {
+    const { envModel, storedMemories, memoryCountUnknown } = facts.longmemory;
+    const holdsMemories = (storedMemories ?? 0) > 0 || memoryCountUnknown === true;
+    if (!holdsMemories || envModel === undefined) return null;
+    return TIER_IDS.filter((id) => MODEL_TIERS[id].longmemory.model === envModel);
+}
+
+/** @param {Facts} facts @returns {Choices} */
+export function recommendedChoices(facts) {
+    const saved = savedChoices(facts);
+    if (saved !== null) return saved;
+    const locked = lockedTiers(facts);
+    const byHardware = recommendTier(facts.hardware);
+    return {
+        schemaVersion: SCHEMA_VERSION,
+        modelTier: locked !== null && locked.length > 0 && !locked.includes(byHardware) ? locked[0] : byHardware,
+        agents: AGENT_IDS.filter((id) => facts.agents[id].installed),
+        bootMode: facts.platform === "linux" ? (facts.lingerEnabled || facts.sudoNonInteractive || facts.selfLingerAllowed === true ? "boot" : "login") : null,
+        qmdFolders: defaultQmdFolders(facts),
+    };
+}
+
+/** Steps that install or build QMD or LongMemory, and so need MIN_NODE (layout.mjs). */
+const BUILD_STEPS = ["install-qmd", "install-longmemory", "rebuild-qmd", "rebuild-longmemory"];
+
+/**
+ * The pending steps the Node that runs builds (`nodeVersion`) is too old for. Checks and
+ * repairs that build nothing run on any Node 22.
+ * @param {readonly { id: string }[]} pending
+ * @param {string} nodeVersion
+ * @returns {string[]}
+ */
+export function stepsNeedingNewerNode(pending, nodeVersion) {
+    return nodeAtLeast(nodeVersion, MIN_NODE) ? [] : pending.flatMap((entry) => (BUILD_STEPS.includes(entry.id) ? [entry.id] : []));
+}
+
+/**
+ * The folders QMD indexes by default: ~/notes when it exists; else, when QMD has no
+ * collection at all yet, a new ~/notes (created with a short README, as the first skill
+ * version did). An existing index's collections are never changed.
+ * @param {Facts} facts
+ * @returns {string[]}
+ */
+export function defaultQmdFolders(facts) {
+    if (facts.notesDir !== null) return [facts.notesDir];
+    return facts.notesPath !== undefined && facts.qmd.collectionPaths.length === 0 ? [facts.notesPath] : [];
+}
+
+/**
+ * The notes folder apply creates (with NOTES_README) before indexing it: ~/notes when it
+ * is chosen, does not exist yet, and is not already a collection. Any other chosen
+ * folder must already exist.
+ * @param {Facts} facts
+ * @param {Choices} choices
+ * @returns {string | null}
+ */
+export function newNotesFolder(facts, choices) {
+    const notes = facts.notesPath;
+    return facts.notesDir === null && notes !== undefined && choices.qmdFolders.includes(notes) && !facts.qmd.collectionPaths.includes(notes) ? notes : null;
+}
+
+/* ------------------------------------------------------------ models */
+
+/**
+ * True when QMD has no index yet: no index.yml `models` block and no collections. Only
+ * then does the chosen size set QMD's model. An index with collections but no models
+ * block (written by an older QMD, or by hand) was built with QMD's defaults, so those stay.
+ * @param {Facts} facts
+ */
+export function qmdIndexIsNew(facts) {
+    return facts.qmd.configModels === undefined && facts.qmd.collectionPaths.length === 0;
+}
+
+/**
+ * The models QMD will use. An index.yml `models` block wins (QMD resolves
+ * config before env and default, and persists what it resolved); an existing index
+ * without one keeps QMD's defaults; only a new index takes the tier's embed model,
+ * which apply then writes into index.yml.
+ * @param {Facts} facts
+ * @param {ModelTier} tier
+ * @returns {Required<QmdModels>}
+ */
+export function effectiveQmdModels(facts, tier) {
+    const configured = facts.qmd.configModels;
+    if (qmdIndexIsNew(facts)) return { ...QMD_DEFAULT_MODELS, embed: MODEL_TIERS[tier].qmd.uri };
+    if (configured === undefined) return { ...QMD_DEFAULT_MODELS };
+    return {
+        embed: configured.embed ?? QMD_DEFAULT_MODELS.embed,
+        generate: configured.generate ?? QMD_DEFAULT_MODELS.generate,
+        rerank: configured.rerank ?? QMD_DEFAULT_MODELS.rerank,
+    };
+}
+
+/**
+ * What QMD will download the first time it needs its models, in plain words. The setup
+ * never downloads QMD models itself: QMD fetches each one lazily on first use, and its
+ * own pull would delete and refetch models it cached earlier.
+ * @param {Facts} facts
+ * @param {ModelTier} tier
+ */
+export function qmdFirstUseDownload(facts, tier) {
+    const uris = [...new Set(Object.values(effectiveQmdModels(facts, tier)))];
+    const cache = facts.qmd.modelCache;
+    // Without a cache check (tests), every model counts: an upper bound.
+    const missing = cache === undefined ? uris : uris.filter((uri) => !cache.cached.includes(uri));
+    const bytes = missing.reduce((sum, uri) => sum + (QMD_MODEL_BYTES[uri] ?? 0), 0);
+    const unknown = missing.some((uri) => QMD_MODEL_BYTES[uri] === undefined || (cache?.unknown ?? []).includes(uri));
+    if (missing.length === 0) return { bytes: 0, note: "QMD's search models are already downloaded on this computer." };
+    const extra = unknown ? " plus models whose size or download state this setup cannot tell" : "";
+    return {
+        bytes,
+        note: `QMD downloads its search models the first time it needs them, so the first search or indexing is slow (${cache === undefined ? "up to " : ""}${aboutGb(bytes)}${extra}).`,
+    };
+}
+
+/** @param {ModelTier} tier */
+export function tierDownloadBytes(tier) {
+    const models = MODEL_TIERS[tier];
+    return [models.qmd.uri, QMD_DEFAULT_MODELS.generate, QMD_DEFAULT_MODELS.rerank].reduce((sum, uri) => sum + QMD_MODEL_BYTES[uri], 0) + OLLAMA_MODEL_BYTES[models.longmemory.model];
+}
+
+/* ------------------------------------------------------------ Ollama */
+
+/**
+ * Ollama's owner after this install. An install the skill performs is predicted:
+ * install.sh creates the system unit on Linux, winget installs the app on Windows,
+ * and the Homebrew formula on macOS has no owner of its own. A server that already
+ * answers is never reinstalled, so it predicts no install.
+ * @param {Facts} facts
+ */
+export function predictedOllamaOwner(facts) {
+    const { ollama } = facts;
+    const willInstall = !ollama.installed && !ollama.healthy;
+    if (facts.platform === "linux") return ollamaServicePlan({ platform: "linux", systemUnitLoaded: ollama.systemUnit.loaded || willInstall });
+    if (facts.platform === "darwin") return ollamaServicePlan({ platform: "darwin", ollamaApp: ollama.ollamaApp, brewService: ollama.brewService });
+    return ollamaServicePlan({ platform: "win32", ollamaApp: ollama.ollamaApp || willInstall });
+}
+
+/**
+ * True when Ollama answers but not from the owner the skill would manage: a manual
+ * `ollama serve`, a snap or docker, an app in a custom folder. Such a server is left alone.
+ * @param {Facts} facts
+ */
+export function ollamaForeign(facts) {
+    const owner = predictedOllamaOwner(facts).owner;
+    if (!facts.ollama.healthy) return false;
+    if (owner === "skill") return !facts.services.ollama;
+    // A setup-owned service with an old runner is the setup's own, not foreign; see serverAction.
+    if (owner === "system-unit") return !facts.ollama.systemUnit.active;
+    return false;
+}
+
+/* ------------------------------------------------------------ actions */
+
+const NO_SYSTEMD =
+    "systemd is not running on this Linux system (WSL without systemd, or a container), so no service can be registered. In WSL, add [boot] systemd=true to /etc/wsl.conf, run wsl --shutdown, then plan again.";
+
+/**
+ * @param {Partial<Action> & Pick<Action, "id" | "summary" | "alreadyDone" | "problem">} fields
+ * @returns {Action}
+ */
+function action(fields) {
+    return { needsAdmin: false, adminCommand: null, downloadBytes: 0, blocker: null, ...fields };
+}
+
+/**
+ * One server per port: a healthy server this setup did not register (a colleague's
+ * own QMD, say) is left alone, because a second instance would crash-loop on the port.
+ * @param {Facts} facts
+ * @param {string} id
+ * @param {string} label
+ * @param {boolean} healthy
+ * @param {boolean} registered
+ * @param {string} startWhen
+ */
+function serverAction(facts, id, label, healthy, registered, startWhen) {
+    const service = /** @type {"qmd" | "longmemory"} */ (id.replace("start-", ""));
+    const stale = registered && (facts.staleServices ?? []).includes(service);
+    const Label = `${label[0].toUpperCase()}${label.slice(1)}`;
+    return action({
+        id,
+        summary: stale
+            ? `Update ${label} to this setup's current settings and restart it.`
+            : healthy && !registered
+              ? `Leave ${label} as it is: it is already running, started outside this setup.`
+              : `Start ${label} and have it start again ${startWhen}.`,
+        alreadyDone: healthy && !stale,
+        blocker: (!healthy || stale) && facts.withoutSystemd === true ? NO_SYSTEMD : null,
+        problem: stale ? `${Label} runs out-of-date settings.` : `${Label} is not running.`,
+    });
+}
+
+/**
+ * Parts of a dotted version, for ordering releases.
+ * @param {string} version
+ */
+function versionParts(version) {
+    return version.split(/[.+-]/).slice(0, 3).map(Number);
+}
+
+/** @param {string} a @param {string} b */
+function newerThan(a, b) {
+    const [x, y] = [versionParts(a), versionParts(b)];
+    for (let i = 0; i < 3; i += 1) if (x[i] !== y[i]) return x[i] > y[i];
+    return false;
+}
+
+/**
+ * Native modules (better-sqlite3) built for a different Node ABI than the Node the setup
+ * runs them with fail to load: rebuild them before any service starts.
+ * @param {Facts} facts
+ * @param {"qmd" | "longmemory"} component
+ */
+function rebuildAction(facts, component) {
+    const built = component === "qmd" ? facts.qmd.nativeAbi : facts.longmemory.nativeAbi;
+    const label = component === "qmd" ? "QMD" : "LongMemory";
+    const current = built === undefined || facts.nodeAbi === undefined || built === facts.nodeAbi;
+    // A QMD the user installed is never rebuilt: its own service or shell may run it with the Node it was built for.
+    const adopted = component === "qmd" && facts.qmd.installedBySetup !== true;
+    return action({
+        id: `rebuild-${component}`,
+        summary: current
+            ? `${label}'s native parts match the Node.js this setup uses.`
+            : adopted
+              ? `Leave the QMD in ${facts.qmd.packageDir ?? "~/.local"} as it is; this setup did not install it and does not rebuild it.`
+              : `Rebuild ${label}'s native parts for the Node.js this setup uses (they were built for Node ABI ${built}; it has ABI ${facts.nodeAbi}), and restart ${label} if this setup runs it.`,
+        alreadyDone: current,
+        blocker:
+            !current && adopted
+                ? `The QMD in ${facts.qmd.packageDir ?? "~/.local"} was built for Node ABI ${built}, but this setup runs Node ABI ${facts.nodeAbi}, and it does not rebuild a QMD it did not install. Run the setup with the Node that QMD was built for, or rebuild QMD yourself (npm rebuild in its folder), then plan again.`
+                : null,
+        problem: `${label}'s native parts were built for a different Node.js version.`,
+    });
+}
+
+/**
+ * Global memory-usage instructions for one chosen agent (see agent_instructions.mjs).
+ * @param {Facts} facts
+ * @param {Choices} choices
+ * @param {AgentId} id
+ */
+function instructionsAction(facts, choices, id) {
+    const found = facts.instructions ?? {
+        shared: false,
+        claudeRules: false,
+        claudeRulesExists: false,
+        claudeRulesSeenByGrok: false,
+        grokCompatRules: true,
+        grokImportsClaudeRules: false,
+        grokExtraDir: false,
+        grokEditable: true,
+        codexBlock: false,
+        opencodeListed: false,
+    };
+    const grokMode = grokInstructionMode({
+        compatRules: found.grokCompatRules,
+        claudeRulesAvailable: choices.agents.includes("claude") || found.claudeRulesExists,
+        claudeRulesSeenByGrok: found.claudeRulesSeenByGrok,
+        importsClaudeRules: found.grokImportsClaudeRules,
+    });
+    const done = {
+        claude: found.claudeRules,
+        codex: found.codexBlock,
+        grok: grokMode === "claude-rules" ? found.claudeRules && !found.grokExtraDir : grokMode === "extra-rule-dir" && found.shared && found.grokExtraDir,
+        opencode: found.shared && found.opencodeListed,
+    };
+    const where = {
+        claude: "a rules file in Claude Code's settings folder",
+        codex: "a marked section of its global AGENTS file",
+        grok: grokMode === "claude-rules" ? "Claude Code's rules file, which Grok already reads" : "a rules folder listed in Grok's settings",
+        opencode: "the instructions list in its settings",
+    };
+    const grokNeedsEdit = grokMode === "extra-rule-dir" ? !found.grokExtraDir : found.grokExtraDir;
+    return action({
+        id: `instructions-${id}`,
+        summary: `Add memory usage instructions to ${AGENT_LABELS[id]}'s global instructions (${where[id]}), so it recalls and stores memories on its own.`,
+        alreadyDone: done[id],
+        blocker:
+            facts.agentProblems?.[id] !== undefined
+                ? (facts.agentProblems[id] ?? null)
+                : id !== "grok" || done.grok
+                  ? null
+                : grokMode === "unsupported"
+                  ? "Grok's Claude-rules setting (GROK_CLAUDE_RULES_ENABLED or compat.claude.rules in its config.toml) is in a form this setup cannot read. Set it to true or false by hand, then plan again."
+                  : grokNeedsEdit && !found.grokEditable
+                    ? "Grok's config.toml defines [paths] in a form this setup does not edit (an inline table, dotted or quoted keys). Add the setup's folder to extra_rule_dirs by hand, then plan again."
+                    : null,
+        problem: `${AGENT_LABELS[id]}'s memory usage instructions are missing or out of date.`,
+    });
+}
+
+/** @param {Facts} facts */
+function qmdInstallAction(facts) {
+    const { version, foreignCommand } = facts.qmd;
+    // Where the adopted QMD lives: ~/.local, or wherever `npm install -g` put it (its README's way).
+    const where = facts.qmd.packageDir ?? "~/.local";
+    if (version !== null && QMD_COMPATIBLE_VERSIONS.includes(version)) {
+        return action({ id: "install-qmd", summary: `Use the QMD ${version} already installed in ${where}.`, alreadyDone: true, problem: "" });
+    }
+    const newest = QMD_COMPATIBLE_VERSIONS.reduce((a, b) => (newerThan(b, a) ? b : a));
+    if (version !== null && newerThan(version, newest)) {
+        // Decided by the version alone, so a newer QMD that is down gets start-qmd, not a blocker.
+        return action({
+            id: "install-qmd",
+            summary: `Use the QMD ${version} already installed in ${where}. It is newer than the versions this skill was checked with (${QMD_COMPATIBLE_VERSIONS.join(", ")}); it is kept and used as it is.`,
+            alreadyDone: true,
+            problem: "",
+        });
+    }
+    if (version !== null) {
+        // Reached only for a version that is neither checked nor newer than every checked one.
+        return action({
+            id: "install-qmd",
+            summary: `Keep the QMD ${version} in ${where}; it is not replaced.`,
+            alreadyDone: false,
+            blocker: `QMD ${version} is installed in ${where}, and this skill works only with QMD ${QMD_COMPATIBLE_VERSIONS.join(" or ")} or newer. It is kept as it is. To go ahead, upgrade it yourself to QMD ${newest} (npm install -g @tobilu/qmd@${newest}, with the same prefix it was installed with), then plan again.`,
+            problem: `QMD ${version} is not a version this setup supports.`,
+        });
+    }
+    if (foreignCommand !== undefined) {
+        return action({
+            id: "install-qmd",
+            summary: "Leave the qmd command already on your PATH alone; no second QMD is installed.",
+            alreadyDone: false,
+            blocker: `A qmd command is on your PATH (${foreignCommand}), but no QMD package could be found for it (not in ~/.local, beside it, or in npm's global folder). This setup will not install a second QMD next to it, because both would share one index. Reinstall QMD with npm (npm install -g @tobilu/qmd), or remove that command, then plan again.`,
+            problem: "QMD is not installed where this setup expects it.",
+        });
+    }
+    return action({
+        id: "install-qmd",
+        summary: `Install QMD ${QMD_VERSION}, a search engine for your notes that runs on this computer.`,
+        downloadBytes: QMD_PACKAGE_BYTES[facts.platform],
+        alreadyDone: false,
+        problem: "QMD is not installed.",
+    });
+}
+
+/** @param {Facts} facts */
+function ollamaInstallAction(facts) {
+    const bytes = ollamaInstallerBytes(facts.platform, facts.arch);
+    if (!facts.ollama.installed && facts.ollama.healthy) {
+        return action({
+            id: "install-ollama",
+            summary: "Use the Ollama server already answering on this computer. No ollama command was found, so models are downloaded through its API.",
+            alreadyDone: true,
+            problem: "",
+        });
+    }
+    const base = { id: "install-ollama", downloadBytes: bytes, alreadyDone: facts.ollama.installed, problem: "Ollama is not installed." };
+    if (facts.platform === "linux") {
+        return action({
+            ...base,
+            summary: `Install Ollama with its official installer (${aboutGb(bytes)}). It runs the memory model on this computer and needs the admin password once. With an AMD graphics card it also downloads ROCm (${aboutGb(OLLAMA_ROCM_BYTES)}); with an NVIDIA card and no working driver it installs NVIDIA's driver packages.`,
+            needsAdmin: !facts.sudoNonInteractive,
+            adminCommand: ollamaAdminCommand(OLLAMA_VERSION),
+        });
+    }
+    if (facts.platform === "darwin") {
+        return action({
+            ...base,
+            summary: "Install Ollama with Homebrew. It runs the memory model on this computer.",
+            needsAdmin: !facts.brewAvailable,
+            adminCommand: "Install Homebrew from https://brew.sh, then run: brew install ollama",
+        });
+    }
+    return action({ ...base, summary: "Install Ollama with winget, accepting its package agreements. It runs the memory model on this computer and needs no admin rights." });
+}
+
+/**
+ * Ordered actions for `choices`. Order matters: Ollama must serve before the model
+ * pull, settings exist before services start, agents connect after the servers run,
+ * and the one step whose admin need can be deferred (start at boot) comes last.
+ * @param {Facts} facts
+ * @param {Choices} choices
+ * @returns {Action[]}
+ */
+export function planActions(facts, choices) {
+    const tier = MODEL_TIERS[choices.modelTier];
+    const owner = predictedOllamaOwner(facts);
+    const foreignOllama = ollamaForeign(facts);
+    const startWhen = facts.platform === "linux" && choices.bootMode === "boot" ? "every time the computer starts" : "every time you log in";
+    const qmdModels = effectiveQmdModels(facts, choices.modelTier);
+    const unit = facts.ollama.systemUnit;
+
+    const actions = [
+        qmdInstallAction(facts),
+        rebuildAction(facts, "qmd"),
+        action({
+            id: "install-longmemory",
+            summary: "Download and build LongMemory, a memory server your AI agents save to and recall from.",
+            downloadBytes: LONGMEMORY_BUILD_BYTES,
+            alreadyDone: facts.longmemory.built,
+            problem: `LongMemory is not built at commit ${LONGMEMORY_COMMIT.slice(0, 8)}.`,
+        }),
+        rebuildAction(facts, "longmemory"),
+        ollamaInstallAction(facts),
+        action({
+            id: "start-ollama",
+            summary: foreignOllama
+                ? "Leave Ollama as it is: it is already running, started outside this setup."
+                : owner.owner === "system-unit"
+                  ? "Make sure the Ollama system service is switched on. It starts every time the computer starts."
+                  : owner.owner === "external"
+                    ? `Start Ollama through ${owner.by}, which already starts it when you log in.`
+                    : `Start Ollama and have it start again ${startWhen}.`,
+            needsAdmin: !foreignOllama && owner.owner === "system-unit" && facts.ollama.installed && !(unit.enabled && unit.active) && !facts.sudoNonInteractive,
+            adminCommand: "sudo systemctl enable --now ollama.service",
+            alreadyDone:
+                foreignOllama ||
+                (facts.ollama.healthy &&
+                    (owner.owner === "system-unit"
+                        ? unit.enabled && unit.active
+                        : owner.owner === "skill"
+                          ? facts.services.ollama && !(facts.staleServices ?? []).includes("ollama")
+                          : true)),
+            blocker: facts.withoutSystemd === true && owner.owner !== "external" && !facts.ollama.healthy ? NO_SYSTEMD : null,
+            problem: "Ollama is not running or not set to start automatically.",
+        }),
+        action({
+            id: "pull-memory-model",
+            summary: `Download the memory model into Ollama (${aboutGb(OLLAMA_MODEL_BYTES[tier.longmemory.model])}).`,
+            downloadBytes: OLLAMA_MODEL_BYTES[tier.longmemory.model],
+            alreadyDone: ollamaHasModel(facts.ollama.models, tier.longmemory.model),
+            problem: "The memory model is missing from Ollama.",
+        }),
+        action({
+            id: "write-settings",
+            summary:
+                facts.qmd.foreignCommand === undefined
+                    ? "Save LongMemory's settings in your user folder, and add the qmd command to your terminal."
+                    : `Save LongMemory's settings in your user folder. Your terminal keeps its own qmd command (${facts.qmd.foreignCommand}).`,
+            alreadyDone: facts.settingsWritten && facts.longmemory.envModel === tier.longmemory.model,
+            problem: "Settings files are missing or out of date.",
+        }),
+        action({
+            id: "set-search-model",
+            summary: qmdIndexIsNew(facts)
+                ? "Set the search model for QMD's new index."
+                : `Keep the search models QMD's index already uses (${qmdModels.embed}).`,
+            alreadyDone: !qmdIndexIsNew(facts),
+            problem: "QMD's index has no search model set.",
+        }),
+        serverAction(facts, "start-qmd", "QMD's search server", facts.qmd.healthy, facts.services.qmd, startWhen),
+        serverAction(facts, "start-longmemory", "the LongMemory server", facts.longmemory.healthy, facts.services.longmemory, startWhen),
+        ...choices.agents.map((id) =>
+            action({
+                id: `connect-${id}`,
+                summary: `Connect ${AGENT_LABELS[id]} to the search and memory servers.`,
+                alreadyDone: facts.agents[id].qmd && facts.agents[id].longmemory,
+                blocker: facts.agentProblems?.[id] ?? null,
+                problem: `${AGENT_LABELS[id]} is not connected to both servers.`,
+            }),
+        ),
+        ...AGENT_IDS.filter((id) => choices.agents.includes(id)).map((id) => instructionsAction(facts, choices, id)),
+    ];
+    if (choices.qmdFolders.length > 0) {
+        actions.push(
+            action({
+                id: "index-folders",
+                summary: `${newNotesFolder(facts, choices) === null ? "" : `Create ${newNotesFolder(facts, choices)} with a short README, as a place for your notes. `}Make these folders searchable: ${choices.qmdFolders.join(", ")}. The first indexing also downloads QMD's embedding model and can take a while; if it is interrupted, the next run continues it.`,
+                // Done only when every chosen folder is a collection whose documents all have vectors,
+                // so an interrupted `qmd embed` is resumed by the next apply. An index that cannot
+                // be read is not assumed complete.
+                // On a Node that cannot read QMD's index without writing (embeddingUnchecked), only
+                // collection membership is checked; the plan notes it.
+                alreadyDone:
+                    facts.qmd.embeddingUnknown !== true &&
+                    choices.qmdFolders.every((folder) => facts.qmd.collectionPaths.includes(folder) && !(facts.qmd.unembeddedFolders ?? []).includes(folder)),
+                problem: facts.qmd.embeddingUnknown === true ? "QMD's index could not be read, so the chosen folders may not be fully indexed." : "A chosen folder is not fully indexed by QMD.",
+            }),
+        );
+    }
+    if (facts.platform === "linux" && choices.bootMode === "boot") {
+        actions.push(
+            action({
+                id: "enable-boot-start",
+                summary: "Let the search and memory servers start when the computer starts, before anyone logs in. This may ask for the admin password once.",
+                needsAdmin: !facts.lingerEnabled && !facts.sudoNonInteractive && facts.selfLingerAllowed !== true,
+                adminCommand: `sudo loginctl enable-linger ${facts.username}`,
+                alreadyDone: facts.lingerEnabled,
+                problem: "Start-at-boot (systemd linger) is off.",
+            }),
+        );
+    }
+    return actions;
+}
+
+/** @param {readonly Action[]} actions */
+export function totals(actions) {
+    const pending = actions.filter((entry) => !entry.alreadyDone);
+    return {
+        downloadBytes: pending.reduce((sum, entry) => sum + entry.downloadBytes, 0),
+        needsAdmin: pending.some((entry) => entry.needsAdmin),
+        blockers: pending.flatMap((entry) => (entry.blocker === null ? [] : [entry.blocker])),
+    };
+}
+
+/**
+ * The plan's view of an action: `problem` is for --check, and an admin command is
+ * shown only when the step needs one.
+ * @param {Action} entry
+ */
+function publicAction(entry) {
+    const { problem: _problem, ...rest } = entry;
+    return { ...rest, adminCommand: entry.needsAdmin ? entry.adminCommand : null };
+}
+
+/**
+ * @param {Facts} facts
+ */
+export function buildPlan(facts) {
+    const saved = savedChoices(facts);
+    const recommended = recommendedChoices(facts);
+    const actions = planActions(facts, recommended);
+    return {
+        schemaVersion: SCHEMA_VERSION,
+        platform: { os: facts.platform, arch: facts.arch, node: facts.nodeVersion },
+        hardware: { ...facts.hardware, appleSilicon: facts.hardware.gpu === "apple" },
+        detected: {
+            disk: facts.disk,
+            sudoNonInteractive: facts.sudoNonInteractive,
+            lingerEnabled: facts.lingerEnabled,
+            agents: facts.agents,
+            qmd: { ...facts.qmd, models: effectiveQmdModels(facts, recommended.modelTier) },
+            longmemory: facts.longmemory,
+            ollama: { ...facts.ollama, owner: predictedOllamaOwner(facts), foreign: ollamaForeign(facts) },
+            services: facts.services,
+            installedModelTier: saved === null ? null : saved.modelTier,
+            lockedTiers: lockedTiers(facts),
+            instructions: facts.instructions ?? null,
+            nodeAbi: facts.nodeAbi ?? null,
+        },
+        recommended,
+        options: {
+            modelTier: TIER_IDS.map((id) => ({ id, approxDownloadBytes: tierDownloadBytes(id), description: MODEL_TIERS[id].description })),
+            bootMode: facts.platform === "linux" ? ["boot", "login"] : [],
+            agents: AGENT_IDS.filter((id) => facts.agents[id].installed),
+        },
+        actions: actions.map(publicAction),
+        totals: { ...totals(actions), firstUseDownloadBytes: qmdFirstUseDownload(facts, recommended.modelTier).bytes },
+        notes: [
+            qmdFirstUseDownload(facts, recommended.modelTier).note,
+            ...(nodeAtLeast(facts.nodeVersion, MIN_NODE)
+                ? []
+                : [`This Node.js (${facts.nodeVersion}) can run the setup's checks, but installing or rebuilding QMD or LongMemory needs Node.js ${MIN_NODE.major}.${MIN_NODE.minor} or newer.`]),
+            ...(facts.qmd.embeddingUnchecked === true ? ["Whether chosen folders are fully indexed could not be checked on this Node.js; only that they are QMD collections was checked."] : []),
+        ],
+    };
+}
+
+/** @typedef {ReturnType<typeof buildPlan>} Plan */
+
+/**
+ * Validate a choices document against `plan`. Every problem is collected, and any
+ * problem rejects the whole document before anything is changed.
+ * @param {Plan} plan
+ * @param {unknown} input
+ * @returns {Choices}
+ */
+export function validateChoices(plan, input) {
+    const problems = choiceProblems(input, { os: plan.platform.os, agents: plan.options.agents, bootModes: plan.options.bootMode });
+    const locked = plan.detected.lockedTiers;
+    const tier = typeof input === "object" && input !== null ? /** @type {Record<string, unknown>} */ (input).modelTier : undefined;
+    if (locked !== null && TIER_IDS.includes(/** @type {ModelTier} */ (tier)) && !locked.includes(/** @type {ModelTier} */ (tier))) {
+        problems.push(
+            `modelTier "${String(tier)}" uses a different memory model than the memories LongMemory already stores (${plan.detected.longmemory.envModel}). Choose ${locked.length > 0 ? locked.join(" or ") : "no other tier"}; switching models makes existing memory vectors unusable.`,
+        );
+    }
+    if (problems.length > 0) throw new Error(`Invalid choices:\n- ${problems.join("\n- ")}`);
+    return /** @type {Choices} */ (input);
+}
+
+/**
+ * The choices apply runs: the file's, validated, or with --yes the plan's recommended
+ * choices, which are the saved choices (minus agents no longer installed) when a setup
+ * exists. `--apply --yes` is therefore also the repair.
+ * @param {Plan} plan
+ * @param {unknown | null} fileChoices parsed --choices document, or null for --yes
+ */
+export function applyChoices(plan, fileChoices) {
+    return validateChoices(plan, fileChoices === null ? plan.recommended : fileChoices);
+}
+
+/**
+ * Chosen folders that must exist now: those QMD does not index yet. A folder already
+ * indexed that was moved away does not block a repair; QMD keeps its collection.
+ * @param {Choices} choices
+ * @param {readonly string[]} collectionPaths
+ */
+export function foldersToAdd(choices, collectionPaths) {
+    return choices.qmdFolders.filter((folder) => !collectionPaths.includes(folder));
+}
+
+/**
+ * When each server starts again after a reboot, in plain words. A server the setup
+ * left alone is reported as not managed by it.
+ * @param {Facts} facts
+ * @param {Choices} choices
+ */
+export function startSummary(facts, choices) {
+    const userServices = facts.platform === "linux" && choices.bootMode === "boot" ? "when the computer starts" : "when you log in";
+    const outside = "not managed by this setup (it was already running)";
+    const owner = predictedOllamaOwner(facts);
+    return {
+        qmd: facts.qmd.healthy && !facts.services.qmd ? outside : userServices,
+        longmemory: facts.longmemory.healthy && !facts.services.longmemory ? outside : userServices,
+        ollama: ollamaForeign(facts)
+            ? outside
+            : owner.owner === "system-unit"
+              ? "when the computer starts"
+              : owner.owner === "external"
+                ? `when you log in (${owner.by})`
+                : userServices,
+    };
+}
+
+/**
+ * Health report for later sessions. Healthy when every action of the saved
+ * choices is already done.
+ * @param {Facts} facts
+ */
+export function checkReport(facts) {
+    const saved = savedChoices(facts);
+    if (saved === null) {
+        return { healthy: false, installed: false, problems: ["Local memory is not set up on this computer yet."], repairActions: [] };
+    }
+    const pending = planActions(facts, saved).filter((entry) => !entry.alreadyDone);
+    return {
+        healthy: pending.length === 0,
+        installed: true,
+        problems: pending.map((entry) => entry.blocker ?? entry.problem),
+        repairActions: pending.map((entry) => entry.id),
+    };
+}
