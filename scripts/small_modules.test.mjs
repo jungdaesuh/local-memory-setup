@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { UsageError, parseArgs } from "./cli_args.mjs";
 import { longMemoryHealthy, ollamaModelNames, qmdHealthy } from "./health.mjs";
-import { pinnedPnpmVersion } from "./longmemory_build.mjs";
 import { ollamaHasModel, ollamaServicePlan } from "./ollama_plan.mjs";
 import { qmdEnvironment, withEnv } from "./qmd_env.mjs";
 import { nodeAtLeast } from "./platform.mjs";
@@ -12,9 +11,9 @@ import { LONGMEMORY_BUILD_BYTES, MCP_ADD_TIMEOUT_MS, downloadTimeoutMs, installT
 const MODEL = "hf:Qwen/Qwen3-Embedding-8B-GGUF/Qwen3-Embedding-8B-Q8_0.gguf";
 
 test("QMD retrieval is always CPU; embed uses Metal on Apple, Vulkan elsewhere, CPU without a GPU; no model variable", () => {
-    assert.deepEqual(qmdEnvironment({ gpu: "nvidia" }, "retrieval"), [["QMD_FORCE_CPU", "1"], ["QMD_LLAMA_GPU", null]]);
-    assert.deepEqual(qmdEnvironment({ gpu: "apple" }, "embed"), [["QMD_FORCE_CPU", null], ["QMD_LLAMA_GPU", "metal"]]);
-    assert.deepEqual(qmdEnvironment({ gpu: "other" }, "embed")[1], ["QMD_LLAMA_GPU", "vulkan"]);
+    assert.deepEqual(qmdEnvironment({ gpu: "nvidia" }, "retrieval"), [["QMD_HOST", null], ["QMD_ALLOWED_ORIGINS", null], ["QMD_ALLOWED_HOSTS", null], ["QMD_FORCE_CPU", "1"], ["QMD_LLAMA_GPU", null]]);
+    assert.deepEqual(qmdEnvironment({ gpu: "apple" }, "embed"), [["QMD_HOST", null], ["QMD_ALLOWED_ORIGINS", null], ["QMD_ALLOWED_HOSTS", null], ["QMD_FORCE_CPU", null], ["QMD_LLAMA_GPU", "metal"]]);
+    assert.deepEqual(qmdEnvironment({ gpu: "other" }, "embed")[4], ["QMD_LLAMA_GPU", "vulkan"]);
     assert.deepEqual(qmdEnvironment({ gpu: "none" }, "embed"), qmdEnvironment({ gpu: "none" }, "retrieval"));
 });
 
@@ -79,12 +78,7 @@ test("ollamaHasModel matches untagged names against :latest", () => {
     assert.equal(ollamaHasModel(["bge-m3:567m"], "bge-m3:567m"), true);
 });
 
-test("pnpm version comes from the checkout's exact packageManager pin", () => {
-    assert.equal(pinnedPnpmVersion('{"packageManager":"pnpm@11.5.2"}'), "11.5.2");
-    assert.equal(pinnedPnpmVersion('{"packageManager":"pnpm@11.5.2+sha512.abc"}'), "11.5.2");
-    assert.throws(() => pinnedPnpmVersion('{"packageManager":"pnpm@^11"}'), /exact pnpm version/);
-    assert.throws(() => pinnedPnpmVersion("{}"), /exact pnpm version/);
-});
+
 
 test("command line: one mode, apply needs exactly one input", () => {
     assert.deepEqual(parseArgs([]), { mode: "--check", yes: false, choicesFile: undefined });

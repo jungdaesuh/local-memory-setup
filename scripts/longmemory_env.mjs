@@ -1,7 +1,6 @@
 /**
  * LongMemory's settings file (~/.config/local-memory-setup/longmemory.env), read by
- * the server through `node --env-file`. Only variables LongMemory reads for
- * `serve` are written: src/server/config.ts (host, port, key, MCP HTTP, database) and
+ * the native agent launcher. Settings follow: src/server/config.ts (host, port, key, MCP HTTP, database) and
  * src/core/embeddings/environment.ts (provider, tier, dimension, Ollama URL and model).
  * Project and user ids are not written: `serve` hardcodes tenant and user "default"
  * (src/cli/context/cli_context.ts memory_config).
@@ -16,7 +15,7 @@ export function longMemorySettings(spec) {
     return [
         ["LONGMEMORY_HOST", "127.0.0.1"],
         ["LONGMEMORY_PORT", String(LONGMEMORY_PORT)],
-        ["LONGMEMORY_MCP_HTTP", "true"],
+        ["LONGMEMORY_MCP_HTTP", "false"],
         ["LONGMEMORY_DB_PATH", spec.dbPath],
         ["LONGMEMORY_EMBEDDING_PROVIDER", "ollama"],
         ["LONGMEMORY_EMBEDDING_TIER", "deep"],
@@ -30,8 +29,7 @@ export function longMemorySettings(spec) {
  * Every variable the file sets, plus LongMemory's key variables (src/server/config.ts:
  * LONGMEMORY_API_KEY, alias OM_API_KEY). The runner unsets all of them before
  * `node --env-file`, because Node lets an inherited environment variable override the
- * file's value, and the server must run keyless: it listens on 127.0.0.1 only, and with
- * no key set its auth middleware lets local calls through (middleware/auth.ts).
+ * file's value. Native stdio uses an agent-owned pipe and never opens an HTTP listener.
  */
 export const LONGMEMORY_ENV_KEYS = [...longMemorySettings({ dbPath: "", model: "", dimension: 0 }).map(([key]) => key), "LONGMEMORY_API_KEY", "OM_API_KEY"];
 
@@ -39,9 +37,9 @@ export const LONGMEMORY_ENV_KEYS = [...longMemorySettings({ dbPath: "", model: "
 export function renderEnvFile(settings) {
     for (const [key, value] of settings) if (/[\r\n]/.test(value)) throw new Error(`${key} cannot hold a line break.`);
     const header = [
-        `# ${MARKER}. Read by LongMemory through node --env-file.`,
+        `# ${MARKER}. Read by the native stdio launcher.`,
         "# LongMemory falls back to a synthetic embedder when Ollama fails (src/core/embeddings/stack.ts);",
-        "# the service runner waits until Ollama lists the model before starting LongMemory.",
+        "# the agent launcher waits until Ollama lists the model before starting LongMemory.",
     ];
     return `${[...header, ...settings.map(([key, value]) => `${key}=${value}`)].join("\n")}\n`;
 }

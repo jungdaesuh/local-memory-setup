@@ -3,50 +3,42 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { layout, longMemoryCli, longMemoryStamp } from "./layout.mjs";
-import { LONGMEMORY_ENV_KEYS, longMemorySettings } from "./longmemory_env.mjs";
+import { fileURLToPath } from "node:url";
+import { buildArtifactFingerprint } from "./build_integrity.mjs";
+import { LONGMEMORY_COMMIT, layout, longMemoryCli, longMemoryStamp, longMemoryStdio } from "./layout.mjs";
+import { reviewedDependencyFingerprint } from "./dependency_install.mjs";
 import {
-    LS_REMOTE_TIMEOUT_MS,
-    acceptServeReady,
+    buildDirectoryName,
+    buildCandidateDir,
     buildDirPlan,
     buildState,
     buildsToKeep,
     checkoutCommitArgs,
-    cloneArgs,
     currentBuildDir,
     directoriesToRemove,
     fetchCommitArgs,
     finishSwitch,
-    installLongMemoryCommit,
-    jsonMessagesFromSse,
-    longMemoryChildEnv,
-    loopbackPort,
-    mcpToolNames,
-    mcpToolsListBody,
-    missingToolNames,
-    parseLsRemoteMain,
+    gitAddRemoteArgs,
+    gitInitArgs,
     pointCurrentAt,
     pruneBuilds,
-    readyFromStdout,
     rollbackSwitch,
-    runSmokeChecks,
     runningLongMemory,
-    shortSha,
-    smokeSettings,
+    smokeInvocation,
     switchCurrentBuild,
-    toolNamesFromMcpHttp,
 } from "./longmemory_build.mjs";
 
 const SHA_A = "a".repeat(40);
 const SHA_B = "b".repeat(40);
 const SHA_C = "c".repeat(40);
+const DEP_A = "1".repeat(64);
+const DEP_B = "2".repeat(64);
+const STDIO_BOOTSTRAP = fileURLToPath(new URL("./longmemory_stdio.mjs", import.meta.url));
 
 /** @param {string} root */
 function tree(root) {
     const longmemoryRoot = path.join(root, "longmemory");
     return {
-        tools: path.join(root, "tools"),
-        pnpmPackage: path.join(root, "pnpm"),
         buildsDir: path.join(longmemoryRoot, "builds"),
         longmemoryRoot,
         currentLink: path.join(longmemoryRoot, "current"),
@@ -56,226 +48,200 @@ function tree(root) {
     };
 }
 
-const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), "lms-lm-"));
-
-/** @param {string} buildDir @param {string} sha */
-function finishBuild(buildDir, sha) {
-    fs.mkdirSync(path.dirname(longMemoryCli(buildDir)), { recursive: true });
-    fs.writeFileSync(longMemoryCli(buildDir), "cli");
-    fs.mkdirSync(path.dirname(longMemoryStamp(buildDir)), { recursive: true });
-    fs.writeFileSync(longMemoryStamp(buildDir), `${sha}\n`);
+/** @param {string} prefix @param {(root: string) => void} operation */
+function withTemp(prefix, operation) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    try {
+        operation(root);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
 }
 
-test("git ls-remote main is one 40-hex sha, and the plan prints twelve digits", () => {
-    assert.equal(LS_REMOTE_TIMEOUT_MS, 30_000);
-    assert.equal(parseLsRemoteMain(`${SHA_A}\trefs/heads/main\n`), SHA_A);
-    assert.equal(parseLsRemoteMain(`${SHA_A}\trefs/heads/main\n\n`), SHA_A);
-    assert.equal(shortSha(SHA_A), "a".repeat(12));
-    assert.throws(() => parseLsRemoteMain(""), /exactly one/);
-    assert.throws(() => parseLsRemoteMain(`${SHA_A}\trefs/heads/main\n${SHA_B}\trefs/heads/main\n`), /exactly one/);
-    assert.throws(() => parseLsRemoteMain("abc\trefs/heads/main\n"), /not a commit sha/);
+/** @param {string} buildDir @param {string} sha @param {string} fingerprint */
+function finishBuild(buildDir, sha, fingerprint) {
+    fs.mkdirSync(path.dirname(longMemoryCli(buildDir)), { recursive: true });
+    fs.mkdirSync(path.join(buildDir, "src"), { recursive: true });
+    fs.mkdirSync(path.join(buildDir, "node_modules"), { recursive: true });
+    fs.writeFileSync(path.join(buildDir, "package.json"), '{"name":"longmemory"}\n');
+    fs.writeFileSync(path.join(buildDir, "package-lock.json"), '{"lockfileVersion":3}\n');
+    fs.writeFileSync(path.join(buildDir, "tsconfig.json"), '{"compilerOptions":{}}\n');
+    fs.writeFileSync(path.join(buildDir, "src", "index.ts"), "export const ready = true;\n");
+    fs.writeFileSync(longMemoryCli(buildDir), "cli");
+    fs.copyFileSync(STDIO_BOOTSTRAP, longMemoryStdio(buildDir));
+    fs.writeFileSync(path.join(buildDir, "node_modules", ".package-lock.json"), '{"lockfileVersion":3,"packages":{}}\n');
+    const artifactFingerprint = buildArtifactFingerprint(buildDir);
+    fs.writeFileSync(longMemoryStamp(buildDir), `${JSON.stringify({ commit: sha, dependencyFingerprint: fingerprint, artifactFingerprint })}\n`);
+}
+
+test("build identity pins the exact source and reviewed dependency bytes", () => {
+    assert.equal(LONGMEMORY_COMMIT, "9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5");
+    assert.equal(buildDirectoryName(SHA_A, DEP_A), `${SHA_A}-${DEP_A.slice(0, 16)}`);
+    assert.equal(buildDirectoryName(SHA_A, DEP_A, 1), `${SHA_A}-${DEP_A.slice(0, 16)}-r1`);
+    assert.throws(() => buildDirectoryName("main", DEP_A), /not a commit sha/);
+    assert.throws(() => buildDirectoryName(SHA_A, "bad"), /not SHA-256/);
+    assert.throws(() => buildDirectoryName(SHA_A, DEP_A, -1), /repair index/);
+    assert.match(reviewedDependencyFingerprint("longmemory"), /^[0-9a-f]{64}$/);
 });
 
-test("clone, fetch, and checkout args build one commit without moving a working tree in place", () => {
-    assert.deepEqual(cloneArgs("https://github.com/CaviraOSS/LongMemory.git", "/b"), [
-        "clone",
-        "--depth",
-        "1",
-        "--branch",
-        "main",
-        "https://github.com/CaviraOSS/LongMemory.git",
-        "/b",
-    ]);
-    assert.deepEqual(fetchCommitArgs("/b", SHA_A), ["-C", "/b", "fetch", "--depth", "1", "origin", SHA_A]);
-    assert.deepEqual(checkoutCommitArgs("/b", SHA_A), ["-C", "/b", "checkout", "--detach", SHA_A]);
+test("git fetch and checkout use only the reviewed commit, never a branch name", () => {
+    const directory = "/builds/candidate";
+    const repo = "https://github.com/CaviraOSS/LongMemory.git";
+    assert.deepEqual(gitInitArgs(directory), ["init", "--quiet", directory]);
+    assert.deepEqual(gitAddRemoteArgs(directory, repo), ["-C", directory, "remote", "add", "origin", repo]);
+    assert.deepEqual(fetchCommitArgs(directory, SHA_A), ["-C", directory, "fetch", "--no-tags", "--depth", "1", "origin", SHA_A]);
+    assert.deepEqual(checkoutCommitArgs(directory, "FETCH_HEAD"), ["-C", directory, "checkout", "--detach", "FETCH_HEAD"]);
 });
 
-test("a candidate directory is created, replaced, reused, or refused when it is the running build", () => {
-    const current = path.resolve("/builds", SHA_A);
-    const other = path.resolve("/builds", SHA_B);
-    assert.equal(buildDirPlan(other, null, "absent"), "create");
-    assert.equal(buildDirPlan(other, current, "partial"), "replace");
-    assert.equal(buildDirPlan(other, current, "complete"), "reuse");
+test("build planning replaces incomplete candidates but preserves the current directory", () => {
+    const current = path.resolve("/builds", buildDirectoryName(SHA_A, DEP_A));
+    const candidate = path.resolve("/builds", buildDirectoryName(SHA_B, DEP_A));
+    assert.equal(buildDirPlan(candidate, null, "absent"), "create");
+    assert.equal(buildDirPlan(candidate, current, "partial"), "replace");
+    assert.equal(buildDirPlan(candidate, current, "complete"), "reuse");
     assert.equal(buildDirPlan(current, current, "complete"), "reuse-current");
     assert.equal(buildDirPlan(current, current, "partial"), "keep-current");
-    assert.equal(buildDirPlan(current, current, "absent"), "keep-current");
 });
 
-test("prune keeps the current and previous shas and ignores other names", () => {
-    assert.deepEqual(directoriesToRemove([SHA_A, SHA_B, SHA_C, "notes", SHA_A.slice(0, 12)], [SHA_A, SHA_C]), [SHA_B]);
-    assert.deepEqual(buildsToKeep(path.join("/builds", SHA_A), path.join("/builds", SHA_B)), [SHA_A, SHA_B]);
-    assert.deepEqual(buildsToKeep(path.join("/builds", SHA_A), path.join("/builds", SHA_A)), [SHA_A]);
-    assert.deepEqual(buildsToKeep("/builds/not-a-sha", null), []);
-    const root = temp();
-    const L = tree(root);
-    fs.mkdirSync(L.buildsDir, { recursive: true });
-    for (const name of [SHA_A, SHA_B, SHA_C, "notes"]) fs.mkdirSync(path.join(L.buildsDir, name));
-    assert.deepEqual(pruneBuilds(L.buildsDir, [SHA_A, SHA_B]), [SHA_C]);
-    assert.deepEqual(fs.readdirSync(L.buildsDir).sort(), [SHA_A, SHA_B, "notes"].sort());
-    fs.rmSync(root, { recursive: true, force: true });
+test("build candidates are reused only when source, lock fingerprint, stamp, and CLI agree", () => {
+    withTemp("lms-lm-state-", (root) => {
+        const candidate = path.join(root, buildDirectoryName(SHA_A, DEP_A));
+        assert.equal(buildState(candidate, SHA_A, DEP_A), "absent");
+        fs.mkdirSync(candidate, { recursive: true });
+        assert.equal(buildState(candidate, SHA_A, DEP_A), "partial");
+        finishBuild(candidate, SHA_A, DEP_A);
+        assert.equal(buildState(candidate, SHA_A, DEP_A), "complete");
+        assert.equal(buildState(candidate, SHA_A, DEP_B), "partial");
+        assert.equal(buildState(candidate, SHA_B, DEP_A), "partial");
+        for (const [file, replacement] of [
+            [path.join(candidate, "src", "index.ts"), "export const ready = false;\n"],
+            [longMemoryCli(candidate), "mutated cli"],
+            [path.join(candidate, "package-lock.json"), '{"lockfileVersion":3,"changed":true}\n'],
+            [path.join(candidate, "node_modules", ".package-lock.json"), '{"lockfileVersion":3,"changed":true}\n'],
+            [longMemoryStdio(candidate), 'import { run_mcp_stdio } from "./dist/mcp/transports/other.js";\n'],
+        ]) {
+            const original = fs.readFileSync(file, "utf8");
+            fs.writeFileSync(file, replacement);
+            assert.equal(buildState(candidate, SHA_A, DEP_A), "partial", `${path.relative(candidate, file)} tampering invalidates the receipt`);
+            fs.writeFileSync(file, original);
+            assert.equal(buildState(candidate, SHA_A, DEP_A), "complete");
+        }
+        fs.rmSync(longMemoryCli(candidate));
+        assert.equal(buildState(candidate, SHA_A, DEP_A), "partial");
+    });
 });
 
-test("current is a relative symlink on Linux and a pointer file on Windows", () => {
-    const root = temp();
-    const L = tree(root);
-    const buildDir = path.join(L.buildsDir, SHA_A);
-    fs.mkdirSync(buildDir, { recursive: true });
-    assert.equal(currentBuildDir(L, "linux"), null);
-    pointCurrentAt(buildDir, L, "linux");
-    assert.equal(fs.readlinkSync(L.currentLink), path.join("builds", SHA_A));
-    assert.equal(currentBuildDir(L, "linux"), buildDir);
-    const win = temp();
-    const W = tree(win);
-    const winBuild = path.join(W.buildsDir, SHA_B);
-    fs.mkdirSync(winBuild, { recursive: true });
-    pointCurrentAt(winBuild, W, "win32");
-    assert.equal(fs.readFileSync(W.currentPointer, "utf8"), `${winBuild}\n`);
-    assert.equal(currentBuildDir(W, "win32"), winBuild);
-    fs.writeFileSync(W.currentPointer, "\n");
-    assert.throws(() => currentBuildDir(W, "win32"), /empty/);
-    fs.unlinkSync(L.currentLink);
-    fs.writeFileSync(L.currentLink, "not a link");
-    assert.throws(() => currentBuildDir(L, "linux"));
-    fs.rmSync(root, { recursive: true, force: true });
-    fs.rmSync(win, { recursive: true, force: true });
+test("a malformed receipt is incomplete and a current build is repaired beside it", () => {
+    withTemp("lms-lm-bad-stamp-", (root) => {
+        const L = tree(root);
+        const canonical = path.join(L.buildsDir, buildDirectoryName(SHA_A, DEP_A));
+        fs.mkdirSync(canonical, { recursive: true });
+        finishBuild(canonical, SHA_A, DEP_A);
+        fs.writeFileSync(longMemoryStamp(canonical), "{broken receipt\n");
+        pointCurrentAt(canonical, L, "linux");
+        assert.equal(buildState(canonical, SHA_A, DEP_A), "partial");
+        assert.equal(buildCandidateDir(L.buildsDir, SHA_A, DEP_A, canonical), path.join(L.buildsDir, buildDirectoryName(SHA_A, DEP_A, 1)));
+        assert.equal(fs.existsSync(canonical), true);
+    });
 });
 
-test("a stamp must name its directory, and an incomplete running build is not deleted", async () => {
-    const root = temp();
-    const L = tree(root);
-    const buildDir = path.join(L.buildsDir, SHA_A);
-    fs.mkdirSync(buildDir, { recursive: true });
-    pointCurrentAt(buildDir, L, "linux");
-    assert.equal(buildState(buildDir, SHA_A), "partial");
-    assert.equal(runningLongMemory(L, "linux"), null);
-    finishBuild(buildDir, SHA_B);
-    assert.throws(() => runningLongMemory(L, "linux"), /stamped/);
-    finishBuild(buildDir, "nope");
-    assert.throws(() => runningLongMemory(L, "linux"), /commit sha/);
-    finishBuild(buildDir, SHA_A);
-    assert.equal(buildState(buildDir, SHA_A), "complete");
-    assert.deepEqual(runningLongMemory(L, "linux"), { dir: buildDir, commit: SHA_A });
-    fs.rmSync(longMemoryCli(buildDir));
-    assert.equal(runningLongMemory(L, "linux"), null);
-    fs.writeFileSync(path.join(buildDir, "keep"), "x");
-    await assert.rejects(installLongMemoryCommit({
-        sha: SHA_A,
-        node: process.execPath,
-        repo: "https://example.invalid/LongMemory.git",
-        platform: "linux",
-        settings: [],
-        tools: [],
-        deferPrune: false,
-        L,
-    }), /failed the build check: .*incomplete/);
-    assert.equal(fs.readFileSync(path.join(buildDir, "keep"), "utf8"), "x");
-    fs.rmSync(root, { recursive: true, force: true });
+test("a SHA-only legacy build stays available as rollback but is never reported reviewed", () => {
+    withTemp("lms-lm-legacy-", (root) => {
+        const L = tree(root);
+        const legacy = path.join(L.buildsDir, LONGMEMORY_COMMIT);
+        fs.mkdirSync(legacy, { recursive: true });
+        fs.mkdirSync(path.dirname(longMemoryCli(legacy)), { recursive: true });
+        fs.writeFileSync(longMemoryCli(legacy), "legacy cli");
+        fs.writeFileSync(longMemoryStamp(legacy), `${LONGMEMORY_COMMIT}\n`);
+        pointCurrentAt(legacy, L, "linux");
+        assert.equal(runningLongMemory(L, "linux"), null);
+    });
 });
 
-test("switch records the previous build, prune waits for finish, and rollback restores it", () => {
-    const root = temp();
-    const L = tree(root);
-    const older = path.join(L.buildsDir, SHA_A);
-    const newer = path.join(L.buildsDir, SHA_B);
-    const extra = path.join(L.buildsDir, SHA_C);
-    fs.mkdirSync(older, { recursive: true });
-    fs.mkdirSync(newer, { recursive: true });
-    fs.mkdirSync(extra, { recursive: true });
-    pointCurrentAt(older, L, "linux");
-    assert.equal(switchCurrentBuild(newer, L, "linux"), older);
-    assert.equal(currentBuildDir(L, "linux"), newer);
-    assert.equal(fs.readFileSync(L.previousBuildFile, "utf8").trim(), older);
-    assert.ok(fs.existsSync(L.switchMarker));
-    assert.equal(rollbackSwitch(L, "linux"), older);
-    assert.equal(currentBuildDir(L, "linux"), older);
-    assert.equal(fs.existsSync(L.switchMarker), false);
-    switchCurrentBuild(newer, L, "linux");
-    assert.deepEqual(finishSwitch(L, "linux"), [SHA_C]);
-    assert.equal(fs.existsSync(extra), false);
-    assert.equal(fs.existsSync(older), true);
-    assert.equal(fs.existsSync(newer), true);
-    assert.equal(fs.existsSync(L.switchMarker), false);
-    assert.deepEqual(finishSwitch(L, "linux"), []);
-    fs.rmSync(root, { recursive: true, force: true });
+test("a corrupt current build remains in place while repair selects a new sibling", () => {
+    withTemp("lms-lm-current-", (root) => {
+        const L = tree(root);
+        const canonical = path.join(L.buildsDir, buildDirectoryName(SHA_A, DEP_A));
+        fs.mkdirSync(canonical, { recursive: true });
+        fs.writeFileSync(path.join(canonical, "preserve"), "current data");
+        pointCurrentAt(canonical, L, "linux");
+        const repair = buildCandidateDir(L.buildsDir, SHA_A, DEP_A, canonical);
+        assert.equal(repair, path.join(L.buildsDir, buildDirectoryName(SHA_A, DEP_A, 1)));
+        assert.notEqual(path.resolve(repair), path.resolve(canonical));
+        assert.equal(fs.readFileSync(path.join(canonical, "preserve"), "utf8"), "current data");
+    });
 });
 
-test("the memory database stays outside builds, and smoke uses port 0 and a throwaway database", () => {
+test("pruning keeps the active and previous reviewed builds plus legacy rollback directories", () => {
+    withTemp("lms-lm-prune-", (root) => {
+        const L = tree(root);
+        const idA = buildDirectoryName(SHA_A, DEP_A);
+        const idB = buildDirectoryName(SHA_B, DEP_A);
+        const idC = buildDirectoryName(SHA_C, DEP_A);
+        assert.deepEqual(directoriesToRemove([idA, idB, idC, SHA_C, "notes"], [idA, idC]), [idB, SHA_C]);
+        assert.deepEqual(buildsToKeep(path.join(L.buildsDir, idA), path.join(L.buildsDir, SHA_B)), [idA, SHA_B]);
+        fs.mkdirSync(L.buildsDir, { recursive: true });
+        for (const name of [idA, idB, idC, SHA_C, "notes"]) fs.mkdirSync(path.join(L.buildsDir, name));
+        assert.deepEqual(pruneBuilds(L.buildsDir, [idA]), [idB, idC, SHA_C].sort());
+        assert.deepEqual(fs.readdirSync(L.buildsDir).sort(), [idA, "notes"].sort());
+    });
+});
+
+test("switch records its rollback target and prunes only after successful startup", () => {
+    withTemp("lms-lm-switch-", (root) => {
+        const L = tree(root);
+        const oldDir = path.join(L.buildsDir, SHA_A);
+        const currentDir = path.join(L.buildsDir, buildDirectoryName(SHA_B, DEP_A));
+        const extraDir = path.join(L.buildsDir, buildDirectoryName(SHA_C, DEP_A));
+        for (const dir of [oldDir, currentDir, extraDir]) fs.mkdirSync(dir, { recursive: true });
+        pointCurrentAt(oldDir, L, "linux");
+        assert.equal(switchCurrentBuild(currentDir, L, "linux"), oldDir);
+        assert.equal(currentBuildDir(L, "linux"), currentDir);
+        assert.equal(fs.readFileSync(L.previousBuildFile, "utf8").trim(), oldDir);
+        assert.ok(fs.existsSync(L.switchMarker));
+        assert.equal(rollbackSwitch(L, "linux"), oldDir);
+        assert.equal(currentBuildDir(L, "linux"), oldDir);
+        assert.equal(fs.existsSync(L.switchMarker), false);
+        switchCurrentBuild(currentDir, L, "linux");
+        assert.deepEqual(finishSwitch(L, "linux"), [path.basename(extraDir)]);
+        assert.equal(fs.existsSync(oldDir), true);
+        assert.equal(fs.existsSync(currentDir), true);
+        assert.equal(fs.existsSync(extraDir), false);
+    });
+});
+
+test("current uses a relative symlink on Unix and an absolute pointer on Windows", () => {
+    withTemp("lms-lm-current-pointer-", (root) => {
+        const L = tree(root);
+        const unixBuild = path.join(L.buildsDir, buildDirectoryName(SHA_A, DEP_A));
+        fs.mkdirSync(unixBuild, { recursive: true });
+        assert.equal(currentBuildDir(L, "linux"), null);
+        pointCurrentAt(unixBuild, L, "linux");
+        assert.equal(fs.readlinkSync(L.currentLink), path.join("builds", path.basename(unixBuild)));
+        assert.equal(currentBuildDir(L, "linux"), unixBuild);
+
+        const windowsBuild = path.join(L.buildsDir, buildDirectoryName(SHA_B, DEP_A));
+        fs.mkdirSync(windowsBuild, { recursive: true });
+        pointCurrentAt(windowsBuild, L, "win32");
+        assert.equal(fs.readFileSync(L.currentPointer, "utf8"), `${windowsBuild}\n`);
+        assert.equal(currentBuildDir(L, "win32"), windowsBuild);
+        fs.writeFileSync(L.currentPointer, "\n");
+        assert.throws(() => currentBuildDir(L, "win32"), /empty/);
+    });
+});
+
+test("native smoke launches the candidate MCP with a throwaway database and required tools", () => {
+    const buildDir = "/builds/candidate";
+    const invocation = smokeInvocation("/node", buildDir, "/private/smoke.db", ["longmemory_recall"]);
+    assert.equal(invocation.command, "/node");
+    assert.equal(invocation.cwd, buildDir);
+    assert.deepEqual(invocation.args, [
+        path.join(buildDir, "stdio_smoke.mjs"),
+        longMemoryStdio(buildDir),
+        "/private/smoke.db",
+        '["longmemory_recall"]',
+    ]);
     const L = layout("linux", "/home/a");
     assert.equal(path.dirname(L.dbPath), path.dirname(L.longmemoryRoot));
     assert.equal(L.dbPath.includes(`${path.sep}builds${path.sep}`), false);
-    const settings = longMemorySettings({ dbPath: L.dbPath, model: "bge-m3", dimension: 1024 });
-    const smoked = smokeSettings(settings, "/tmp/throwaway.db");
-    assert.equal(Object.fromEntries(smoked).LONGMEMORY_PORT, "0");
-    assert.equal(Object.fromEntries(smoked).LONGMEMORY_DB_PATH, "/tmp/throwaway.db");
-    assert.equal(Object.fromEntries(smoked).LONGMEMORY_HOST, "127.0.0.1");
-    assert.equal(Object.fromEntries(smoked).LONGMEMORY_MCP_HTTP, "true");
-    const env = longMemoryChildEnv({ PATH: "/bin", LONGMEMORY_PORT: "1", LONGMEMORY_API_KEY: "k", KEEP: "1" });
-    assert.equal(env.KEEP, "1");
-    assert.equal(env.PATH, "/bin");
-    for (const key of LONGMEMORY_ENV_KEYS) assert.equal(Object.hasOwn(env, key), false);
-});
-
-test("serve ready must be loopback /mcp, and tools/list is read from SSE or JSON", () => {
-    const ready = { ok: true, command: "serve", ready: true, url: "http://127.0.0.1:43123/", mcp_url: "http://127.0.0.1:43123/mcp" };
-    assert.deepEqual(acceptServeReady(ready), { port: 43123, mcpUrl: ready.mcp_url });
-    assert.equal(loopbackPort(ready.url), 43123);
-    assert.throws(() => acceptServeReady({ ...ready, url: "http://0.0.0.0:43123/" }), /127\.0\.0\.1/);
-    assert.throws(() => acceptServeReady({ ...ready, mcp_url: "http://127.0.0.1:43123/health" }), /\/mcp/);
-    assert.equal(readyFromStdout('noise\n{"ok":true}\n'), null);
-    assert.equal(readyFromStdout(`${JSON.stringify(ready)}`), null);
-    assert.deepEqual(readyFromStdout(`${JSON.stringify(ready)}\n`), ready);
-    const message = { jsonrpc: "2.0", id: 1, result: { tools: [{ name: "longmemory_recall" }, { name: "longmemory_ingest" }] } };
-    const sse = `event: message\ndata: ${JSON.stringify(message)}\n\n`;
-    assert.deepEqual(jsonMessagesFromSse(sse), [message]);
-    assert.deepEqual(toolNamesFromMcpHttp("text/event-stream", sse).names, ["longmemory_recall", "longmemory_ingest"]);
-    assert.deepEqual(toolNamesFromMcpHttp("application/json", JSON.stringify(message)).names, ["longmemory_recall", "longmemory_ingest"]);
-    const failed = toolNamesFromMcpHttp("application/json", JSON.stringify({ jsonrpc: "2.0", id: 1, error: { message: "nope" } }));
-    assert.deepEqual(failed.errors, ["nope"]);
-    assert.deepEqual(missingToolNames(["longmemory_recall", "longmemory_ingest"], ["longmemory_recall"]), ["longmemory_ingest"]);
-    assert.equal(JSON.parse(mcpToolsListBody()).method, "tools/list");
-});
-
-test("smoke checks stop the server when a check fails and name the commit", async () => {
-    const commit = SHA_A;
-    let stopped = 0;
-    let second = 0;
-    await assert.rejects(
-        runSmokeChecks({
-            commit,
-            stop: async () => {
-                stopped += 1;
-            },
-            checks: [
-                {
-                    name: "health",
-                    run: async () => {
-                        throw new Error("HTTP 500");
-                    },
-                },
-                {
-                    name: "tools/list",
-                    run: async () => {
-                        second += 1;
-                    },
-                },
-            ],
-        }),
-        new RegExp(`LongMemory ${commit} failed the health check: HTTP 500`),
-    );
-    assert.equal(stopped, 1);
-    assert.equal(second, 0);
-    await runSmokeChecks({
-        commit,
-        stop: async () => {
-            stopped += 1;
-        },
-        checks: [{ name: "serve", run: async () => {} }],
-    });
-    assert.equal(stopped, 2);
-});
-
-test("mcp tool names come from the result list only", () => {
-    const parsed = mcpToolNames([{ result: { tools: [{ name: "longmemory_recall" }, { title: "x" }, "nope"] } }, { error: { message: "bad" } }]);
-    assert.deepEqual(parsed.names, ["longmemory_recall"]);
-    assert.deepEqual(parsed.errors, ["bad"]);
 });

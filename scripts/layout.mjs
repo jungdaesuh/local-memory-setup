@@ -1,8 +1,7 @@
 /**
  * Where everything lives and which versions are installed. Single source for
  * paths, ports, URLs, and pinned upstream versions; detection and apply both read it.
- * LongMemory is not pinned to one commit: apply builds the current `main` of
- * LONGMEMORY_REPO (see longmemory_build.mjs).
+ * LongMemory source and both dependency graphs are frozen for review.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -10,19 +9,19 @@ import os from "node:os";
 import path from "node:path";
 import { npmGlobalBin, npmGlobalBinDir } from "./platform.mjs";
 
-/** Installed when no QMD exists. Contract verified against this release: `mcp --http --port`, `/health`, `embed -c`, `collection add --name --mask`, `--index`, QMD_* env, index.yml `models`. */
-export const QMD_VERSION = "2.5.3";
+/** Installed when no QMD exists. Contract verified against this release: native `mcp`, legacy `/health` detection, `embed -c`, `collection add --name --mask`, `--index`, QMD_* env, index.yml `models`. */
+export const QMD_VERSION = "2.8.3";
 /**
  * Existing QMD releases the skill adopts instead of reinstalling. Each was checked
  * against the same contract in its published dist/ (2.8.3: cli/qmd.js mcp/embed/--index/
  * collection options, llm.js resolveEmbedModel and QMD_* env, mcp/server.js /health and
  * listen on QMD_HOST ?? "localhost", cli ensureModelsConfiguredForCli).
  */
-export const QMD_COMPATIBLE_VERSIONS = ["2.5.3", "2.8.3"];
+export const QMD_COMPATIBLE_VERSIONS = ["2.8.3"];
+export const LONGMEMORY_COMMIT = "9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5";
 export const LONGMEMORY_REPO = "https://github.com/CaviraOSS/LongMemory.git";
 /**
- * Node needed to install or rebuild QMD and LongMemory: pnpm 11.5.2 (LongMemory's
- * packageManager) needs >=22.13, and the setup reads its databases read-only through
+ * Node needed to install or rebuild QMD and LongMemory. The setup reads its databases through
  * SQLite URI filenames (`file:...?immutable=1`), which official Node builds support from
  * 22.15. A health check on an older Node works; it reports those checks as unknown.
  */
@@ -82,7 +81,7 @@ export function ollamaAdminCommand(version) {
 }
 
 /**
- * LongMemory's built CLI and the stamp written after `pnpm build` (that build deletes dist first).
+ * LongMemory's built CLI and the stamp written after `npm run build` (that build deletes dist first).
  * @param {string} buildDir
  */
 export function longMemoryCli(buildDir) {
@@ -94,15 +93,9 @@ export function longMemoryStamp(buildDir) {
     return path.join(buildDir, "dist", `.${MARKER}-commit`);
 }
 
-/**
- * How the service runner starts LongMemory: env file, then `serve`, no extra flags.
- * The smoke test starts a candidate build with the same arguments.
- * @param {string} node
- * @param {string} envFile
- * @param {string} cli
- */
-export function longMemoryServeArgv(node, envFile, cli) {
-    return [node, `--env-file=${envFile}`, cli, "serve"];
+/** Native transport bootstrap installed beside the reviewed build's dist. */
+export function longMemoryStdio(buildDir) {
+    return path.join(buildDir, "longmemory_stdio.mjs");
 }
 
 /**
@@ -140,9 +133,8 @@ export function layout(platform = process.platform, home = os.homedir(), env = p
     const prefix = join(home, ".local");
     const share = join(home, ".local", "share", MARKER);
     const configDir = join(home, ".config", MARKER);
-    const tools = join(share, "tools");
     const modulesDir = (root) => (platform === "win32" ? join(root, "node_modules") : join(root, "lib", "node_modules"));
-    // Builds live under longmemory/builds/<sha>. The database stays beside that tree, not inside a build.
+    // Builds live under longmemory/builds/<sha>-<dependency fingerprint>. The database stays beside that tree, not inside a build.
     const longmemoryRoot = join(share, "longmemory");
     // OllamaSetup.exe installs to {localappdata}\\Programs\\Ollama (app/ollama.iss DefaultDirName).
     const ollamaWindowsDir = join(env.LOCALAPPDATA ?? join(home, "AppData", "Local"), "Programs", "Ollama");
@@ -169,8 +161,8 @@ export function layout(platform = process.platform, home = os.homedir(), env = p
         npmBinDir: npmGlobalBinDir(prefix, platform),
         qmdShim: npmGlobalBin(prefix, "qmd", platform),
         qmdPackage: join(modulesDir(prefix), "@tobilu", "qmd"),
-        tools,
-        pnpmPackage: join(modulesDir(tools), "pnpm"),
+        qmdRoot: join(share, "qmd"),
+        reviewedQmdPackage: join(share, "qmd", "node_modules", "@tobilu", "qmd"),
         longmemoryRoot,
         buildsDir: join(longmemoryRoot, "builds"),
         // Symlink to the running build on Linux and macOS. Windows has no equivalent the runner can follow, so it reads currentPointer.

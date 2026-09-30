@@ -11,28 +11,30 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { grokState, opencodeEffectiveInstructions, opencodeMcpNames } from "./agent_config_files.mjs";
+import { pathToFileURL } from "node:url";
+import { grokState, opencodeEffectiveInstructions, opencodeFilesIn } from "./agent_config_files.mjs";
 import { codexInstructionsTarget, instructionsBlockCurrent, instructionsText } from "./agent_instructions.mjs";
 import { nativeModuleAbi, nativeModuleFile } from "./executor_steps.mjs";
 import { readIfExists } from "./fs_util.mjs";
 import { longMemoryHealthy, ollamaModelNames, qmdHealthy } from "./health.mjs";
-import { LONGMEMORY_HEALTH_URL, LONGMEMORY_REPO, MARKER, OLLAMA_TAGS_URL, QMD_HEALTH_URL, SERVICE_NAMES, SQLITE_URI_NODE } from "./layout.mjs";
-import { resolveLongMemoryMain, runningLongMemory } from "./longmemory_build.mjs";
+import { LONGMEMORY_COMMIT, LONGMEMORY_HEALTH_URL, MARKER, OLLAMA_TAGS_URL, QMD_HEALTH_URL, QMD_VERSION, SERVICE_NAMES, SQLITE_URI_NODE } from "./layout.mjs";
+import { runningLongMemory } from "./longmemory_build.mjs";
 import { parseEnvFile } from "./longmemory_env.mjs";
-import { jsonServerNames, serverDefined } from "./mcp_config.mjs";
+import { memoryClientSpecs, memoryRuntimeCurrent } from "./mcp_runtime.mjs";
+import { reviewedDependencyFingerprint } from "./dependency_install.mjs";
 import { QMD_DEFAULT_MODELS } from "./model_choice.mjs";
 import { AGENT_IDS } from "./plan.mjs";
 import { binEntry, nodeAtLeast } from "./platform.mjs";
 import { commandPath, probeJson, run } from "./proc.mjs";
+import { memoryStoragePrivate } from "./private_storage.mjs";
+import { jsonServerNames } from "./mcp_config.mjs";
 import { qmdCollections, qmdConfiguredModels, qmdModelCacheFile } from "./qmd_state.mjs";
 import { MANAGED_MARKER, managedPathBlockState } from "./service_files.mjs";
-import { GATE_FILES, dispatcherText, longMemoryRunnerText, ollamaRunnerText, qmdRunnerText, rcPathLine, runnerFile } from "./service_specs.mjs";
+import { dispatcherText, ollamaRunnerText, rcPathLine, runnerFile } from "./service_specs.mjs";
+import { inspectStdioJson, inspectStdioToml } from "./stdio_config.mjs";
 
 /** @typedef {import("./plan.mjs").Facts} Facts */
 /** @typedef {ReturnType<typeof import("./layout.mjs").layout>} Layout */
-
-const SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 export const RC_FILES = [".zshrc", ".bashrc", ".profile"];
 
@@ -52,6 +54,7 @@ function parseNamedJson(file, text) {
 
 /** @param {string} file */
 function managedFileExists(file) {
+    if (fs.lstatSync(file, { throwIfNoEntry: false })?.isFile() !== true) return false;
     const text = readIfExists(file);
     return text !== null && text.includes(MANAGED_MARKER);
 }
@@ -134,15 +137,34 @@ function selfLingerAllowed() {
 function serviceOwn(L, service) {
     const names = SERVICE_NAMES[service];
     if (process.platform === "linux") {
-        if (!systemdRunning() || !managedFileExists(path.join(L.systemdUserDir, names.systemd))) return false;
+        if (!managedFileExists(path.join(L.systemdUserDir, names.systemd))) return false;
+        if (service !== "ollama") return true;
+        if (!systemdRunning()) return false;
         const enabled = run("systemctl", ["--user", "is-enabled", names.systemd], { allowFail: true, timeoutMs: 15_000 });
         return enabled.stdout.trim() === "enabled";
     }
     if (process.platform === "darwin") {
         if (!managedFileExists(path.join(L.launchAgentsDir, `${names.launchd}.plist`))) return false;
+        if (service !== "ollama") return true;
         return run("launchctl", ["print", `gui/${os.userInfo().uid}/${names.launchd}`], { allowFail: true, timeoutMs: 15_000 }).status === 0;
     }
-    return run("schtasks", ["/Query", "/TN", names.task], { allowFail: true, timeoutMs: 15_000 }).status === 0;
+    const task = run("schtasks", ["/Query", "/TN", names.task, "/XML"], { allowFail: true, timeoutMs: 15_000 });
+    return task.status === 0 && task.stdout.includes(MANAGED_MARKER);
+}
+
+/** An unmarked registration occupies the exact service name and must never be replaced. */
+function serviceForeign(L, service) {
+    const names = SERVICE_NAMES[service];
+    if (process.platform === "linux") {
+        const unit = path.join(L.systemdUserDir, names.systemd);
+        return fs.existsSync(unit) && !managedFileExists(unit);
+    }
+    if (process.platform === "darwin") {
+        const agent = path.join(L.launchAgentsDir, `${names.launchd}.plist`);
+        return fs.existsSync(agent) && !managedFileExists(agent);
+    }
+    const task = run("schtasks", ["/Query", "/TN", names.task, "/XML"], { allowFail: true, timeoutMs: 15_000 });
+    return task.status === 0 && !task.stdout.includes(MANAGED_MARKER);
 }
 
 /**
@@ -345,10 +367,11 @@ function readAgentConfig(agent, file, read, fallback, problems) {
  * Which agents are installed and wired. Config files are parsed only for `relevant`
  * agents (installed or chosen); a malformed one is recorded in `problems`.
  * @param {Layout} L
+ * @param {string} node the absolute Node path used in desired native stdio entries
  * @param {(installed: Record<AgentId, boolean>) => Set<AgentId>} relevantFor
  * @returns {{ agents: Facts["agents"], problems: Partial<Record<AgentId, string>> }}
  */
-function detectAgents(L, relevantFor) {
+function detectAgents(L, node, relevantFor) {
     const installed = {
         claude: commandPath("claude") !== null,
         codex: commandPath("codex") !== null || fs.existsSync(path.dirname(L.codexConfig)),
@@ -358,26 +381,66 @@ function detectAgents(L, relevantFor) {
     const relevant = relevantFor(installed);
     /** @type {Partial<Record<AgentId, string>>} */
     const problems = {};
-    const claudeNames = relevant.has("claude")
-        ? readAgentConfig("claude", L.claudeJson, () => {
-              const text = readIfExists(L.claudeJson);
-              return text === null ? [] : jsonServerNames(JSON.parse(text), "mcpServers");
-          }, /** @type {string[]} */ ([]), problems)
-        : [];
+    const specs = memoryClientSpecs(L, node);
+    const missing = /** @type {ReturnType<typeof inspectStdioJson>} */ ([]);
+    const claudeChecks = relevant.has("claude")
+        ? readAgentConfig("claude", L.claudeJson, () => inspectStdioJson(readIfExists(L.claudeJson) ?? "", "claude", specs), missing, problems)
+        : missing;
     const codexToml = relevant.has("codex") ? readIfExists(L.codexConfig) ?? "" : "";
     const grokToml = relevant.has("grok") ? readIfExists(L.grokConfig) ?? "" : "";
-    // Every name OpenCode loads, from both of its directories: `mcp add` would replace any of them.
-    const opencodeNames = relevant.has("opencode") ? readAgentConfig("opencode", L.opencodeMcpDir, () => opencodeMcpNames(L), /** @type {string[]} */ ([]), problems) : [];
-    const wired = {
-        claude: (name) => claudeNames.includes(name),
-        codex: (name) => serverDefined(codexToml, name),
-        grok: (name) => serverDefined(grokToml, name),
-        opencode: (name) => opencodeNames.includes(name),
-    };
+    const codexChecks = relevant.has("codex") ? inspectStdioToml(codexToml, specs) : missing;
+    const grokChecks = relevant.has("grok") ? inspectStdioToml(grokToml, specs) : missing;
+    const opencodeChecks = relevant.has("opencode")
+        ? readAgentConfig("opencode", L.opencodeMcpDir, () => inspectOpenCodeMemoryConfig(L, specs), missing, problems)
+        : missing;
+    const checks = { claude: claudeChecks, codex: codexChecks, grok: grokChecks, opencode: opencodeChecks };
+    for (const id of AGENT_IDS) {
+        const conflict = checks[id].find((entry) => entry.state === "foreign" || entry.state === "blocked");
+        if (conflict !== undefined && problems[id] === undefined) {
+            problems[id] = `${conflict.name} has a ${conflict.state} MCP configuration${conflict.reason === undefined ? "" : ` (${conflict.reason})`}; resolve it before migrating memory connections.`;
+        }
+    }
     const agents = /** @type {Facts["agents"]} */ (
-        Object.fromEntries(AGENT_IDS.map((id) => [id, { installed: installed[id], qmd: wired[id]("qmd"), longmemory: wired[id]("longmemory") }]))
+        Object.fromEntries(
+            AGENT_IDS.map((id) => [
+                id,
+                {
+                    installed: installed[id],
+                    qmd: checks[id].some((entry) => entry.name === "qmd" && entry.state === "ready"),
+                    longmemory: checks[id].some((entry) => entry.name === "longmemory" && entry.state === "ready"),
+                },
+            ]),
+        )
     );
     return { agents, problems };
+}
+
+/** OpenCode's MCP command target is the sole existing JSON/JSONC file with memory servers;
+ * without one, it follows the loader's JSON-first preference.
+ * @param {Layout} L
+ */
+export function opencodeMcpConfigFile(L) {
+    const files = opencodeFilesIn(L, L.opencodeMcpDir).filter((entry) => ["opencode.json", "opencode.jsonc"].includes(path.basename(entry.file)));
+    const withMemoryServers = files.filter((entry) => jsonServerNames(entry.config, "mcp").some((name) => name === "qmd" || name === "longmemory"));
+    if (withMemoryServers.length === 1) return withMemoryServers[0].file;
+    return files.find((entry) => path.basename(entry.file) === "opencode.json")?.file ?? files.find((entry) => path.basename(entry.file) === "opencode.jsonc")?.file ?? path.join(L.opencodeMcpDir, "opencode.json");
+}
+
+/** @param {Layout} L @param {ReturnType<typeof memoryClientSpecs>} specs */
+function inspectOpenCodeMemoryConfig(L, specs) {
+    const target = opencodeMcpConfigFile(L);
+    const files = [...new Set([L.opencodeMcpDir, L.opencodeInstructionsDir])].flatMap((directory) => opencodeFilesIn(L, directory));
+    const targetChecks = inspectStdioJson(readIfExists(target) ?? "", "opencode", specs);
+    return targetChecks.map((check) => {
+        const definitions = files.filter((entry) => typeof entry.config.mcp === "object" && entry.config.mcp !== null && Object.hasOwn(entry.config.mcp, check.name));
+        if (definitions.length > 1) {
+            return { name: check.name, state: "foreign", reason: "The same server is defined more than once across OpenCode configs; only a single owned entry can be migrated." };
+        }
+        if (definitions.length === 1 && definitions[0].file !== target) {
+            return { name: check.name, state: "foreign", reason: `The server is defined in ${definitions[0].file}, outside the setup's MCP config target.` };
+        }
+        return check;
+    });
 }
 
 /**
@@ -403,6 +466,7 @@ function isQmdPackage(dir) {
  * @returns {string | null}
  */
 export function locateQmdPackage(L) {
+    if (isQmdPackage(L.reviewedQmdPackage)) return L.reviewedQmdPackage;
     if (isQmdPackage(L.qmdPackage)) return L.qmdPackage;
     const onPath = commandPath("qmd");
     if (onPath !== null && process.platform !== "win32") {
@@ -425,12 +489,21 @@ export function locateQmdPackage(L) {
  * @param {string | null} packageJsonText the found package's package.json
  */
 export function qmdInstalledBySetup(packageDir, L, stampText, packageJsonText) {
-    return packageDir === L.qmdPackage && stampText !== null && packageJsonText !== null && JSON.parse(stampText).version === JSON.parse(packageJsonText).version;
+    if (packageDir !== L.qmdPackage || stampText === null || packageJsonText === null) return false;
+    const stamp = JSON.parse(stampText);
+    return stamp.installedBy === MARKER && stamp.dependencyFingerprint === undefined && stamp.version === JSON.parse(packageJsonText).version;
+}
+
+/** @param {string | null} packageDir @param {Layout} L @param {string | null} stampText @param {string | null} packageJsonText */
+function qmdReviewedCurrent(packageDir, L, stampText, packageJsonText) {
+    if (packageDir !== L.reviewedQmdPackage || stampText === null || packageJsonText === null) return false;
+    const stamp = JSON.parse(stampText);
+    return stamp.installedBy === MARKER && stamp.version === JSON.parse(packageJsonText).version && stamp.version === QMD_VERSION && stamp.dependencyFingerprint === reviewedDependencyFingerprint("qmd");
 }
 
 /**
  * @param {Layout} L
- * `resolveMain` asks the network for refs/heads/main. The health check leaves it false.
+ * `resolveMain` remains accepted for older callers; source identity is pinned in layout.mjs.
  * @param {{ probeAdmin: boolean, resolveMain: boolean }} options
  * @returns {Promise<Facts>}
  */
@@ -449,7 +522,7 @@ export async function detectFacts(L, options) {
     const savedText = readIfExists(L.choicesPath);
     const saved = savedText === null ? null : parseNamedJson(L.choicesPath, savedText);
     const savedAgents = new Set(typeof saved === "object" && saved !== null && Array.isArray(/** @type {{ agents?: unknown }} */ (saved).agents) ? /** @type {{ agents: AgentId[] }} */ (saved).agents : []);
-    const detectedAgents = detectAgents(L, (installed) => new Set(AGENT_IDS.filter((id) => installed[id] || savedAgents.has(id))));
+    const detectedAgents = detectAgents(L, node, (installed) => new Set(AGENT_IDS.filter((id) => installed[id] || savedAgents.has(id))));
     const relevantAgents = new Set(AGENT_IDS.filter((id) => detectedAgents.agents[id].installed || savedAgents.has(id)));
     /** @type {Partial<Record<AgentId, string>>} */
     const agentProblems = { ...detectedAgents.problems };
@@ -467,28 +540,24 @@ export async function detectFacts(L, options) {
     const cacheFiles = modelUris.map((uri) => /** @type {const} */ ([uri, qmdModelCacheFile(uri)]));
     const qmdInstallStamp = readIfExists(L.qmdInstallStamp);
     const running = runningLongMemory(L, process.platform);
-    const main = options.resolveMain ? resolveLongMemoryMain(LONGMEMORY_REPO) : undefined;
+    const main = LONGMEMORY_COMMIT;
+    const privateStorage = memoryStoragePrivate(L, platform);
+    const nativeRuntime = nodeUsable && memoryRuntimeCurrent(L, node);
+    const reviewedQmd = qmdReviewedCurrent(qmdPackageDir, L, qmdInstallStamp, qmdPackageJson);
     const abiOf = (component) => {
         const sourceDir = running === null ? path.join(L.buildsDir, "absent") : running.dir;
-        const file = nativeModuleFile(component, { qmdPackage: qmdPackageDir ?? L.qmdPackage, sourceDir });
+        const file = nativeModuleFile(component, {
+            qmdPackage: qmdPackageDir ?? L.reviewedQmdPackage,
+            ...(qmdPackageDir === L.reviewedQmdPackage ? { qmdRoot: L.qmdRoot } : {}),
+            sourceDir,
+        });
         return fs.existsSync(file) ? nativeModuleAbi(fs.readFileSync(file)) : null;
     };
     const [qmdAbi, longMemoryAbi] = [abiOf("qmd"), abiOf("longmemory")];
-    const model = env.LONGMEMORY_OLLAMA_EMBEDDING_MODEL;
-    const gateCurrent = GATE_FILES.every((name) => readIfExists(path.join(L.gateDir, name)) === fs.readFileSync(path.join(SCRIPTS_DIR, name), "utf8"));
-    /** @type {Record<"qmd" | "longmemory" | "ollama", string | null>} */
-    const expectedRunners = {
-        qmd: qmdEntry === null ? null : qmdRunnerText({ node, qmdEntry, gpu: hardware.gpu, platform }),
-        longmemory: model === undefined ? null : longMemoryRunnerText({ node, L, model, platform }),
-        ollama: binary === null ? null : ollamaRunnerText({ binary, platform }),
-    };
     const own = { qmd: serviceOwn(L, "qmd"), longmemory: serviceOwn(L, "longmemory"), ollama: serviceOwn(L, "ollama") };
-    const staleServices = /** @type {("qmd" | "longmemory" | "ollama")[]} */ (["qmd", "longmemory", "ollama"]).filter((service) => {
-        if (!own[service]) return false;
-        const runnerCurrent = expectedRunners[service] !== null && readIfExists(runnerFile(L, platform, service)) === expectedRunners[service];
-        // The Ollama runner starts the ollama binary, not Node; the LongMemory runner also runs the gate scripts.
-        return !(runnerCurrent && (service === "ollama" || nodeUsable) && (service !== "longmemory" || gateCurrent));
-    });
+    const foreignServices = /** @type {("qmd" | "longmemory")[]} */ (["qmd", "longmemory"]).filter((service) => serviceForeign(L, service));
+    const expectedOllamaRunner = binary === null ? null : ollamaRunnerText({ binary, platform });
+    const staleServices = own.ollama && (expectedOllamaRunner === null || readIfExists(runnerFile(L, platform, "ollama")) !== expectedOllamaRunner) ? ["ollama"] : [];
     const dbExists = fs.existsSync(L.dbPath);
     const storedMemories = dbExists ? countMemories(L.dbPath) : 0;
     const withoutSystemd = platform === "linux" && !systemdRunning();
@@ -524,13 +593,15 @@ export async function detectFacts(L, options) {
                 unknown: cacheFiles.flatMap(([uri, name]) => (name === null ? [uri] : [])),
             },
             installedBySetup: qmdInstalledBySetup(qmdPackageDir, L, qmdInstallStamp, qmdPackageJson),
+            reviewed: reviewedQmd,
+            reviewedOwned: qmdPackageDir === L.reviewedQmdPackage,
             ...(qmdPackageDir === null ? {} : { packageDir: qmdPackageDir }),
             ...(qmdAbi === null ? {} : { nativeAbi: qmdAbi }),
         },
         longmemory: {
             built: running !== null,
             ...(running === null ? {} : { current: running.commit }),
-            ...(main === undefined ? {} : { main }),
+            main,
             healthy: longMemoryHealthy(longMemoryBody),
             envFile: envText !== null,
             ...(env.LONGMEMORY_OLLAMA_EMBEDDING_MODEL === undefined ? {} : { envModel: env.LONGMEMORY_OLLAMA_EMBEDDING_MODEL }),
@@ -550,7 +621,10 @@ export async function detectFacts(L, options) {
             brewService: platform === "darwin" && fs.existsSync(path.join(L.launchAgentsDir, "homebrew.mxcl.ollama.plist")),
         },
         services: own,
-        settingsWritten: envText !== null && dispatcherOk && (foreignCommand !== null || pathConfigured(L)),
+        foreignServices,
+        privateStorage,
+        nativeRuntime,
+        settingsWritten: envText !== null && dispatcherOk && reviewedQmd && nativeRuntime && privateStorage && (foreignCommand !== null || pathConfigured(L)),
         saved,
         notesDir: fs.existsSync(L.notesDir) && fs.statSync(L.notesDir).isDirectory() ? L.notesDir : null,
         notesPath: L.notesDir,

@@ -20,6 +20,7 @@ import {
     validateChoices,
 } from "./plan.mjs";
 import { LONGMEMORY_BUILD_BYTES } from "./sizes.mjs";
+import { LONGMEMORY_COMMIT } from "./layout.mjs";
 
 const GIB = 1024 * 1024 * 1024;
 const QWEN06 = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
@@ -45,10 +46,13 @@ function facts(overrides = {}) {
         lingerEnabled: false,
         brewAvailable: false,
         agents: { claude: agent, codex: agent, grok: agent, opencode: agent },
-        qmd: { version: null, healthy: false, collectionPaths: [] },
-        longmemory: { built: false, healthy: false, envFile: false, dbExists: false },
+        qmd: { version: null, healthy: false, collectionPaths: [], reviewed: false, reviewedOwned: false },
+        longmemory: { built: false, healthy: false, main: LONGMEMORY_COMMIT, envFile: false, dbExists: false },
         ollama: { installed: false, healthy: false, models: [], systemUnit: { loaded: false, enabled: false, active: false }, ollamaApp: false, brewService: false },
         services: { qmd: false, longmemory: false, ollama: false },
+        foreignServices: [],
+        privateStorage: false,
+        nativeRuntime: false,
         settingsWritten: false,
         saved: null,
         notesDir: null,
@@ -63,11 +67,13 @@ function healthyFacts(saved = SAVED) {
     const wired = { installed: true, qmd: true, longmemory: true };
     return facts({
         agents: { claude: wired, codex: wired, grok: { installed: false, qmd: false, longmemory: false }, opencode: { installed: false, qmd: false, longmemory: false } },
-        qmd: { version: "2.5.3", healthy: true, collectionPaths: ["/home/ana/notes"], configModels: { embed: QWEN06, generate: EXPAND, rerank: RERANK } },
-        longmemory: { built: true, healthy: true, envFile: true, envModel: "bge-m3", dbExists: true, storedMemories: 12 },
+        qmd: { version: "2.8.3", healthy: false, reviewed: true, reviewedOwned: true, collectionPaths: ["/home/ana/notes"], configModels: { embed: QWEN06, generate: EXPAND, rerank: RERANK } },
+        longmemory: { built: true, healthy: false, main: LONGMEMORY_COMMIT, current: LONGMEMORY_COMMIT, envFile: true, envModel: "bge-m3", dbExists: true, storedMemories: 12 },
         ollama: { installed: true, healthy: true, models: ["bge-m3:latest"], systemUnit: { loaded: true, enabled: true, active: true }, ollamaApp: false, brewService: false },
-        services: { qmd: true, longmemory: true, ollama: false },
+        services: { qmd: false, longmemory: false, ollama: false },
         settingsWritten: true,
+        privateStorage: true,
+        nativeRuntime: true,
         lingerEnabled: true,
         nodeAbi: "127",
         instructions: {
@@ -152,40 +158,23 @@ test("QMD is installed only when none exists", () => {
     assert.equal(fresh.downloadBytes, 405_000_000);
 });
 
-test("an existing supported QMD (2.5.3 or 2.8.3) is adopted, never reinstalled or downgraded", () => {
-    for (const version of ["2.5.3", "2.8.3"]) {
-        const adopted = find(planActions(facts({ qmd: { ...facts().qmd, version } }), SAVED), "install-qmd");
-        assert.equal(adopted.alreadyDone, true, version);
-        assert.match(adopted.summary, new RegExp(`Use the QMD ${version.replaceAll(".", "\\.")} already installed`));
-        assert.equal(adopted.downloadBytes, 0);
-    }
+test("the setup's legacy QMD is replaced by the reviewed dependency graph", () => {
+    const legacy = facts({ qmd: { ...facts().qmd, version: "2.5.3", packageDir: "/home/ana/.local/lib/node_modules/@tobilu/qmd", installedBySetup: true } });
+    const action = find(planActions(legacy, SAVED), "install-qmd");
+    assert.equal(action.alreadyDone, false);
+    assert.equal(action.blocker, null);
+    assert.match(action.summary, /Replace this setup's legacy QMD with reviewed QMD 2\.8\.3/);
 });
 
-test("an unsupported installed QMD blocks the plan with a decision, and is left in place", () => {
-    const plan = buildPlan(facts({ qmd: { ...facts().qmd, version: "1.9.0" } }));
-    const refused = find(plan.actions, "install-qmd");
+test("only the QMD package with the reviewed install stamp is ready", () => {
+    const f = facts({ qmd: { ...facts().qmd, version: "2.8.3", reviewed: true, reviewedOwned: true } });
+    const action = find(planActions(f, SAVED), "install-qmd");
+    assert.equal(action.alreadyDone, true);
+    assert.equal(action.downloadBytes, 0);
+    const external = facts({ qmd: { ...facts().qmd, version: "2.8.3", packageDir: "/opt/qmd/node_modules/@tobilu/qmd" } });
+    const refused = find(planActions(external, SAVED), "install-qmd");
     assert.equal(refused.alreadyDone, false);
-    assert.match(refused.blocker ?? "", /QMD 1\.9\.0 is installed in ~\/\.local, and this skill works only with QMD 2\.5\.3 or 2\.8\.3 or newer.*upgrade it yourself.*@tobilu\/qmd@2\.8\.3/);
-    assert.equal(plan.totals.blockers.length, 1);
-});
-
-test("a working QMD newer than every checked version is used, in plan, apply, and check alike", () => {
-    const working = facts({ qmd: { ...facts().qmd, version: "2.9.0", healthy: true } });
-    const adopted = find(planActions(working, SAVED), "install-qmd");
-    assert.equal(adopted.alreadyDone, true);
-    assert.equal(adopted.blocker, null);
-    assert.match(adopted.summary, /newer than the versions this skill was checked with.*kept and used/);
-    assert.doesNotMatch(adopted.summary, /npm install|@tobilu\/qmd@/);
-    // The same predicate feeds apply's blockers: a repair of other components is not blocked.
-    const setUp = healthyFacts();
-    const repair = { ...setUp, qmd: { ...setUp.qmd, version: "2.9.0" }, longmemory: { ...setUp.longmemory, healthy: false } };
-    assert.deepEqual(buildPlan(repair).totals.blockers, []);
-    assert.deepEqual(checkReport(repair).repairActions, ["start-longmemory"]);
-    // Decided by the version alone: the same QMD while it is down is still used, so start-qmd can repair it.
-    const down = { ...repair, qmd: { ...repair.qmd, healthy: false } };
-    assert.equal(find(planActions(down, SAVED), "install-qmd").alreadyDone, true);
-    assert.deepEqual(buildPlan(down).totals.blockers, []);
-    assert.deepEqual(checkReport(down).repairActions, ["start-qmd", "start-longmemory"]);
+    assert.match(refused.blocker ?? "", /dependency graph and HTTP service ownership are not verified/);
 });
 
 test("a qmd on PATH from outside ~/.local blocks a second install", () => {
@@ -298,14 +287,15 @@ test("only a step that needs admin shows an admin command", () => {
 
 test("start-at-boot needs no admin when polkit allows self-linger", () => {
     const boot = (f) => find(planActions(f, SAVED), "enable-boot-start");
-    assert.equal(boot(facts()).needsAdmin, true);
-    assert.equal(boot(facts({ selfLingerAllowed: true })).needsAdmin, false);
+    const noOllamaSystemUnit = { loaded: false, enabled: false, active: false };
+    assert.equal(boot(facts({ ollama: { ...facts().ollama, installed: true, systemUnit: noOllamaSystemUnit } })).needsAdmin, true);
+    assert.equal(boot(facts({ selfLingerAllowed: true, ollama: { ...facts().ollama, installed: true, systemUnit: noOllamaSystemUnit } })).needsAdmin, false);
 });
 
 test("Linux without systemd blocks the service steps with a clear reason", () => {
     const plan = buildPlan(facts({ withoutSystemd: true }));
     assert.ok(plan.totals.blockers.some((blocker) => /systemd is not running/.test(blocker)));
-    assert.match(find(plan.actions, "start-qmd").blocker ?? "", /wsl\.conf/);
+    assert.equal(find(plan.actions, "start-qmd").blocker, null);
 });
 
 test("macOS installs Ollama with Homebrew and owns the service; the app or brew services take over when present", () => {
@@ -325,11 +315,12 @@ test("Windows relies on the Ollama app's login item after winget installs it", (
 
 /* ---------------------------------------------------------------- ordering (F4) */
 
-test("actions are ordered so each step's inputs exist, and the deferrable admin step is last", () => {
+test("security and runtime actions precede settings and agent migration", () => {
     const withClaude = facts({ agents: { ...facts().agents, claude: { installed: true, qmd: false, longmemory: false } } });
     const actions = planActions(withClaude, { ...SAVED, agents: ["claude"] });
     const ids = actions.map((entry) => entry.id);
     const before = (a, b) => assert.ok(ids.indexOf(a) < ids.indexOf(b), `${a} before ${b}: ${ids.join(",")}`);
+    before("secure-storage", "install-qmd");
     before("install-ollama", "start-ollama");
     before("start-ollama", "pull-memory-model");
     before("install-qmd", "write-settings");
@@ -339,28 +330,41 @@ test("actions are ordered so each step's inputs exist, and the deferrable admin 
     before("pull-memory-model", "start-longmemory");
     before("start-longmemory", "connect-claude");
     before("connect-claude", "index-folders");
-    assert.equal(ids.at(-1), "enable-boot-start");
-    const boot = ids.indexOf("enable-boot-start");
-    assert.ok(actions.slice(boot + 1).every((entry) => entry.needsAdmin), "no non-admin step follows the deferrable admin step");
 });
 
-test("boot start is an action only for Linux boot mode", () => {
-    assert.ok(planActions(facts(), { ...SAVED, bootMode: "boot" }).some((entry) => entry.id === "enable-boot-start"));
-    assert.ok(!planActions(facts(), { ...SAVED, bootMode: "login" }).some((entry) => entry.id === "enable-boot-start"));
+test("boot linger is needed only for a setup-owned Ollama user service", () => {
+    const userOllama = { ...facts().ollama, installed: true, systemUnit: { loaded: false, enabled: false, active: false } };
+    assert.ok(planActions(facts({ ollama: userOllama }), { ...SAVED, bootMode: "boot" }).some((entry) => entry.id === "enable-boot-start"));
+    assert.ok(!planActions(facts({ ollama: userOllama }), { ...SAVED, bootMode: "login" }).some((entry) => entry.id === "enable-boot-start"));
+    assert.ok(!planActions(facts(), { ...SAVED, bootMode: "boot" }).some((entry) => entry.id === "enable-boot-start"));
     assert.ok(!planActions(facts({ platform: "darwin" }), { ...SAVED, bootMode: null }).some((entry) => entry.id === "enable-boot-start"));
 });
 
 /* ---------------------------------------------------------------- servers left alone */
 
-test("a server already answering on its port, started elsewhere, is left alone", () => {
-    const f = facts({ qmd: { ...facts().qmd, version: "2.5.3", healthy: true } });
+test("an unmanaged legacy QMD HTTP listener blocks migration until it is stopped", () => {
+    const f = facts({ nativeRuntime: true, qmd: { ...facts().qmd, version: null, reviewed: true, healthy: true } });
     const start = find(planActions(f, SAVED), "start-qmd");
-    assert.equal(start.alreadyDone, true);
-    assert.match(start.summary, /already running, started outside this setup/);
-    assert.equal(startSummary(f, SAVED).qmd, "not managed by this setup (it was already running)");
-    const ours = { ...f, services: { ...f.services, qmd: true } };
-    assert.match(find(planActions(ours, SAVED), "start-qmd").summary, /^Start QMD's search server/);
-    assert.equal(startSummary(ours, SAVED).qmd, "when the computer starts");
+    assert.equal(start.alreadyDone, false);
+    assert.match(start.blocker ?? "", /HTTP server is answering outside this setup's managed service/);
+    assert.equal(startSummary(f, SAVED).qmd, "not ready for native stdio connections");
+    const managed = { ...f, qmd: { ...f.qmd, healthy: false }, services: { ...f.services, qmd: true } };
+    assert.equal(find(planActions(managed, SAVED), "start-qmd").alreadyDone, false);
+    assert.match(find(planActions(managed, SAVED), "start-qmd").summary, /Retire this setup's old QMD HTTP service/);
+});
+
+test("unmarked QMD and LongMemory registrations block native stdio readiness", () => {
+    const f = { ...healthyFacts(), foreignServices: ["qmd", "longmemory"] };
+    const actions = planActions(f, SAVED);
+    for (const id of ["start-qmd", "start-longmemory"]) {
+        assert.equal(find(actions, id).alreadyDone, false, id);
+        assert.match(find(actions, id).blocker ?? "", /unmarked service registration/);
+    }
+    assert.deepEqual(startSummary(f, SAVED), {
+        qmd: "not ready for native stdio connections",
+        longmemory: "not ready for native stdio connections",
+        ollama: "when the computer starts",
+    });
 });
 
 test("write-settings is out of date when the settings file names another memory model", () => {
@@ -440,35 +444,45 @@ test("bootMode must be null outside Linux, and Windows folders must be absolute 
 
 /* ---------------------------------------------------------------- check */
 
-test("check: not installed, healthy, one broken service, and a blocker as the problem text", () => {
+test("check: not installed, healthy, a pending stdio migration, and a blocker as the problem text", () => {
     assert.deepEqual(checkReport(facts()), { healthy: false, installed: false, problems: ["Local memory is not set up on this computer yet."], repairActions: [] });
     assert.deepEqual(checkReport(healthyFacts()), { healthy: true, installed: true, problems: [], repairActions: [] });
     const down = healthyFacts();
-    const report = checkReport({ ...down, qmd: { ...down.qmd, healthy: false } });
+    const report = checkReport({ ...down, services: { ...down.services, qmd: true } });
     assert.equal(report.healthy, false);
     assert.deepEqual(report.repairActions, ["start-qmd"]);
-    const noSystemd = checkReport({ ...down, withoutSystemd: true, qmd: { ...down.qmd, healthy: false } });
-    assert.match(noSystemd.problems[0], /systemd is not running/);
+    const noSystemd = checkReport({ ...down, withoutSystemd: true, services: { ...down.services, qmd: true } });
+    assert.doesNotMatch(noSystemd.problems[0], /systemd is not running/);
 });
 
-test("start summary says boot or login per owner", () => {
-    assert.deepEqual(startSummary(healthyFacts(), SAVED), { qmd: "when the computer starts", longmemory: "when the computer starts", ollama: "when the computer starts" });
+test("native memory servers start on demand while Ollama follows its owner", () => {
+    assert.deepEqual(startSummary(healthyFacts(), SAVED), { qmd: "on demand when an agent connects over stdio", longmemory: "on demand when an agent connects over stdio", ollama: "when the computer starts" });
     const login = startSummary(facts({ platform: "darwin", brewAvailable: true }), { ...SAVED, bootMode: null });
-    assert.deepEqual(login, { qmd: "when you log in", longmemory: "when you log in", ollama: "when you log in" });
+    assert.deepEqual(login, { qmd: "not ready for native stdio connections", longmemory: "not ready for native stdio connections", ollama: "when you log in" });
 });
 
-/* ---------------------------------------------------------------- round 2 */
+test("missing native runtime keeps settings and both stdio servers pending", () => {
+    const f = { ...healthyFacts(), nativeRuntime: false };
+    const actions = planActions(f, SAVED);
+    for (const id of ["write-settings", "start-qmd", "start-longmemory"]) assert.equal(find(actions, id).alreadyDone, false, id);
+    assert.deepEqual(startSummary(f, SAVED), {
+        qmd: "not ready for native stdio connections",
+        longmemory: "not ready for native stdio connections",
+        ollama: "when the computer starts",
+    });
+});
 
-test("the setup's own service with an out-of-date runner is updated, not treated as foreign", () => {
-    const stale = { ...healthyFacts(), staleServices: /** @type {("qmd" | "longmemory")[]} */ (["qmd", "longmemory"]) };
+test("setup-owned old HTTP registrations are pending retirement even if their runner is current", () => {
+    const stale = healthyFacts();
+    stale.services = { ...stale.services, qmd: true, longmemory: true };
     const actions = planActions(stale, SAVED);
     for (const id of ["start-qmd", "start-longmemory"]) {
         assert.equal(find(actions, id).alreadyDone, false, id);
-        assert.match(find(actions, id).summary, /^Update .* restart it\.$/);
+        assert.match(find(actions, id).summary, /^Retire this setup's old .* HTTP service/);
     }
-    assert.deepEqual(startSummary(stale, SAVED), { qmd: "when the computer starts", longmemory: "when the computer starts", ollama: "when the computer starts" });
+    assert.deepEqual(startSummary(stale, SAVED), { qmd: "not ready for native stdio connections", longmemory: "not ready for native stdio connections", ollama: "when the computer starts" });
     assert.deepEqual(checkReport(stale).repairActions, ["start-qmd", "start-longmemory"]);
-    // A healthy server that is not the setup's own stays foreign, stale list or not.
+    // A stopped old service has no listener left, so native stdio is ready.
     const foreign = { ...stale, services: { qmd: false, longmemory: false, ollama: false } };
     assert.equal(find(planActions(foreign, SAVED), "start-qmd").alreadyDone, true);
 });
@@ -491,7 +505,7 @@ test("only folders QMD does not index yet must exist for apply", () => {
 
 test("the write-settings summary does not claim to add qmd when another qmd comes first on PATH", () => {
     const f = facts({ qmd: { ...facts().qmd, version: "2.5.3", foreignCommand: "/usr/local/bin/qmd" } });
-    assert.match(find(planActions(f, SAVED), "write-settings").summary, /keeps its own qmd command \(\/usr\/local\/bin\/qmd\)/);
+    assert.match(find(planActions(f, SAVED), "write-settings").summary, /keeps its existing qmd command \(\/usr\/local\/bin\/qmd\)/);
 });
 
 test("an existing QMD index without a models block keeps QMD's defaults instead of taking the tier's model", () => {
@@ -576,15 +590,13 @@ test("memory instructions: one action per chosen agent, done from the files each
 
 /* ---------------------------------------------------------------- round 5 */
 
-test("a QMD this setup did not install is never rebuilt: an ABI mismatch blocks, naming both ABIs", () => {
-    const adopted = { ...healthyFacts(), nodeAbi: "127", qmd: { ...healthyFacts().qmd, nativeAbi: "137", installedBySetup: false } };
-    const step = find(planActions(adopted, SAVED), "rebuild-qmd");
+test("the reviewed QMD is rebuilt when its native module ABI differs", () => {
+    const reviewed = { ...healthyFacts(), nodeAbi: "127", qmd: { ...healthyFacts().qmd, nativeAbi: "137" } };
+    const step = find(planActions(reviewed, SAVED), "rebuild-qmd");
     assert.equal(step.alreadyDone, false);
-    assert.match(step.blocker ?? "", /built for Node ABI 137, but this setup runs Node ABI 127, and it does not rebuild a QMD it did not install/);
-    assert.match(step.summary, /does not rebuild it/);
-    assert.ok(buildPlan(adopted).totals.blockers.some((blocker) => /does not rebuild a QMD/.test(blocker)));
-    // Matching ABIs: nothing to do, owned or not.
-    assert.equal(find(planActions({ ...adopted, nodeAbi: "137" }, SAVED), "rebuild-qmd").alreadyDone, true);
+    assert.equal(step.blocker, null);
+    assert.match(step.summary, /Rebuild QMD's native parts/);
+    assert.equal(find(planActions({ ...reviewed, nodeAbi: "137" }, SAVED), "rebuild-qmd").alreadyDone, true);
 });
 
 test("index-folders is pending, with its own problem text, when QMD's index cannot be read", () => {
@@ -634,16 +646,15 @@ test("the first-use note counts only QMD models not already downloaded, and says
 
 const NPM_GLOBAL_QMD = "/opt/homebrew/lib/node_modules/@tobilu/qmd";
 
-test("a compatible QMD in npm's global folder is adopted where it is, and the plan is not blocked", () => {
-    // QMD installed the way its README says (npm install -g @tobilu/qmd), nothing in ~/.local.
+test("a QMD in npm's global folder remains foreign even when its version is supported", () => {
     const f = facts({
         qmd: { version: "2.8.3", healthy: true, collectionPaths: [], foreignCommand: "/opt/homebrew/bin/qmd", packageDir: NPM_GLOBAL_QMD, installedBySetup: false },
     });
     const plan = buildPlan(f);
     const install = find(plan.actions, "install-qmd");
-    assert.equal(install.alreadyDone, true);
-    assert.equal(install.summary, `Use the QMD 2.8.3 already installed in ${NPM_GLOBAL_QMD}.`);
-    assert.deepEqual(plan.totals.blockers, []);
+    assert.equal(install.alreadyDone, false);
+    assert.match(install.blocker ?? "", new RegExp(`existing QMD installation was found at ${NPM_GLOBAL_QMD}`));
+    assert.match(find(plan.actions, "start-qmd").blocker ?? "", /HTTP server is answering outside this setup/);
 });
 
 test("an adopted QMD outside ~/.local built for another Node is never rebuilt: the plan names it and stops", () => {
@@ -657,18 +668,17 @@ test("an adopted QMD outside ~/.local built for another Node is never rebuilt: t
     assert.match(rebuild.summary, new RegExp(`Leave the QMD in ${NPM_GLOBAL_QMD} as it is`));
 });
 
-test("a QMD version between the supported ones is not called older, and the message names where it is", () => {
+test("any unowned QMD version blocks adoption and names its path", () => {
     for (const version of ["2.6.0", "1.9.0"]) {
         const refused = find(planActions(facts({ qmd: { ...facts().qmd, version, packageDir: NPM_GLOBAL_QMD } }), SAVED), "install-qmd");
-        assert.match(refused.blocker ?? "", new RegExp(`QMD ${version.replaceAll(".", "\\.")} is installed in ${NPM_GLOBAL_QMD}, and this skill works only with`));
-        assert.doesNotMatch(`${refused.blocker} ${refused.problem}`, /older/);
-        assert.equal(refused.problem, `QMD ${version} is not a version this setup supports.`);
+        assert.match(refused.blocker ?? "", new RegExp(`existing QMD installation was found at ${NPM_GLOBAL_QMD}`));
+        assert.match(refused.problem, /reviewed dependency graph/);
     }
 });
 
 test("a qmd command with no QMD package behind it still blocks, and says where the setup looked", () => {
     const blocked = find(planActions(facts({ qmd: { ...facts().qmd, foreignCommand: "/opt/bun/bin/qmd" } }), SAVED), "install-qmd");
-    assert.match(blocked.blocker ?? "", /no QMD package could be found for it \(not in ~\/\.local, beside it, or in npm's global folder\)/);
+    assert.match(blocked.blocker ?? "", /existing QMD installation was found at \/opt\/bun\/bin\/qmd/);
 });
 
 test("a chosen agent whose config cannot be read blocks its own steps only, naming the file", () => {
@@ -728,38 +738,36 @@ test("only installs and rebuilds need Node 22.15; repairs that build nothing do 
     assert.deepEqual(stepsNeedingNewerNode([{ id: "start-qmd" }, { id: "connect-claude" }], "22.12.0"), []);
 });
 
-test("LongMemory main is named when resolved, and a build behind it is rebuilt and restarted", () => {
-    const main = "0123456789abcdef0123456789abcdef01234567";
+test("LongMemory uses the reviewed source pin and rebuilds when either source or graph changes", () => {
+    const main = LONGMEMORY_COMMIT;
     const current = "fedcba9876543210fedcba9876543210fedcba98";
     const offline = find(planActions(facts(), SAVED), "install-longmemory");
     assert.equal(offline.alreadyDone, false);
-    assert.equal(offline.problem, "LongMemory is not built.");
+    assert.match(offline.problem, /pinned LongMemory build or its reviewed dependency graph is missing/);
     assert.equal(offline.downloadBytes, LONGMEMORY_BUILD_BYTES);
-    assert.doesNotMatch(offline.summary, /main @/);
+    assert.match(offline.summary, /pinned LongMemory @/);
 
     const installed = healthyFacts();
-    const behind = { ...installed, longmemory: { ...installed.longmemory, built: true, current, main, healthy: true } };
+    const behind = { ...installed, longmemory: { ...installed.longmemory, built: false, current, main, healthy: false } };
     const install = find(planActions(behind, SAVED), "install-longmemory");
     assert.equal(install.alreadyDone, false);
-    assert.match(install.summary, /LongMemory main @ 0123456789ab/);
-    assert.match(install.summary, /The running build is fedcba987654\./);
+    assert.match(install.summary, /Build pinned LongMemory @ 9ee2c8e1ed42 with its reviewed dependency graph/);
     assert.equal(install.downloadBytes, LONGMEMORY_BUILD_BYTES);
-    assert.equal(install.problem, "LongMemory is not running main @ 0123456789ab.");
     const start = find(planActions(behind, SAVED), "start-longmemory");
     assert.equal(start.alreadyDone, false);
-    assert.equal(start.summary, "Restart the LongMemory server on LongMemory main @ 0123456789ab.");
+    assert.match(start.problem, /reviewed LongMemory stdio runtime is missing/);
     assert.equal(longMemoryRestartPending(behind), true);
 
     const same = { ...installed, longmemory: { ...installed.longmemory, built: true, current: main, main } };
     const done = find(planActions(same, SAVED), "install-longmemory");
     assert.equal(done.alreadyDone, true);
-    assert.equal(done.summary, "LongMemory main @ 0123456789ab is the running build.");
+    assert.match(done.summary, /Pinned LongMemory @ 9ee2c8e1ed42 and its reviewed dependency graph are installed/);
     assert.equal(done.downloadBytes, 0);
     assert.equal(find(planActions(same, SAVED), "start-longmemory").alreadyDone, true);
 
     const foreign = facts({ longmemory: { built: false, healthy: true, main, envFile: false, dbExists: false } });
-    assert.equal(find(planActions(foreign, SAVED), "start-longmemory").alreadyDone, true);
-    assert.match(find(planActions(foreign, SAVED), "install-longmemory").summary, /No LongMemory build is running/);
+    assert.equal(find(planActions(foreign, SAVED), "start-longmemory").alreadyDone, false);
+    assert.match(find(planActions(foreign, SAVED), "start-longmemory").blocker ?? "", /HTTP server is answering outside this setup/);
     assert.equal(isLongMemoryAction("install-longmemory"), true);
     assert.equal(isLongMemoryAction("rebuild-longmemory"), true);
     assert.equal(isLongMemoryAction("start-longmemory"), true);

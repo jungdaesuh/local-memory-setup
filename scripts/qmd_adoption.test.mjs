@@ -86,6 +86,18 @@ test("the setup's own ~/.local QMD comes first, and a folder that is not QMD is 
     assert.equal(locateQmdPackage(L), L.qmdPackage);
 });
 
+test("the reviewed private QMD package takes precedence over legacy and global installs", POSIX_ONLY, (t) => {
+    const root = tempDir("lms-reviewed-qmd-");
+    const L = layout("linux", path.join(root, "home"), {});
+    const reviewed = fakeQmdPackage(L.reviewedQmdPackage, "2.8.3");
+    fakeQmdPackage(L.qmdPackage, "2.5.3");
+    const globalRoot = path.join(root, "global", "node_modules");
+    fakeQmdPackage(path.join(globalRoot, "@tobilu", "qmd"), "2.8.3");
+    fakeNpm(path.join(root, "npm-bin"), globalRoot);
+    withPath(t, `${path.join(root, "npm-bin")}:/usr/bin:/bin`);
+    assert.equal(locateQmdPackage(L), reviewed);
+});
+
 test("only a QMD in the setup's own prefix with its install stamp is the setup's, so only that one is ever rebuilt", () => {
     const L = { qmdPackage: "/h/.local/lib/node_modules/@tobilu/qmd" };
     const stamp = JSON.stringify({ version: "2.5.3", installedBy: "local-memory-setup" });
@@ -95,5 +107,6 @@ test("only a QMD in the setup's own prefix with its install stamp is the setup's
     assert.equal(qmdInstalledBySetup("/opt/homebrew/lib/node_modules/@tobilu/qmd", L, stamp, pkg), false);
     assert.equal(qmdInstalledBySetup(L.qmdPackage, L, null, pkg), false);
     assert.equal(qmdInstalledBySetup(L.qmdPackage, L, stamp, JSON.stringify({ name: "@tobilu/qmd", version: "2.8.3" })), false);
+    assert.equal(qmdInstalledBySetup(L.qmdPackage, L, JSON.stringify({ ...JSON.parse(stamp), dependencyFingerprint: "legacy" }), pkg), false);
     assert.equal(qmdInstalledBySetup(null, L, stamp, null), false);
 });

@@ -1,6 +1,6 @@
 /**
- * Text of every file the installer generates: QMD dispatcher and runners,
- * the LongMemory runner, systemd units, LaunchAgent plists, and Task Scheduler XML.
+ * Text of every file the installer generates: the QMD dispatcher, Ollama runner,
+ * systemd units, LaunchAgent plists, and Task Scheduler XML.
  * Each renderer owns the quoting rules of its own format. Values a format cannot
  * carry safely raise an error instead of being written half-quoted.
  */
@@ -130,32 +130,6 @@ export function runnerScript(spec, platform) {
 }
 
 /**
- * Windows LongMemory runner. The CLI path is read from current.txt on every start
- * (`%LONGMEMORY_BUILD%`), so a switch takes effect on the next loop without rewriting
- * this file. That expansion cannot go through quoteWindowsArg, which rejects `%`.
- * @param {{ node: string, envFile: string, pointer: string, env: readonly EnvSetting[], pathPrepend: string, gate: readonly string[] }} spec
- */
-export function longMemoryWindowsRunner(spec) {
-    for (const file of [spec.node, spec.envFile, spec.pointer, spec.pathPrepend]) {
-        if (/["%\r\n\0]/.test(file)) throw new Error(`Cannot write ${JSON.stringify(file)} into the LongMemory runner.`);
-    }
-    return cmdFile([
-        "@echo off",
-        `rem ${MANAGED_MARKER}`,
-        "setlocal",
-        ...(spec.env.length > 0 ? [cmdEnv(spec.env)] : []),
-        cmdPathPrepend(spec.pathPrepend),
-        ":run",
-        `${spec.gate.map(quoteWindowsArg).join(" ")} || goto pause`,
-        `set /p LONGMEMORY_BUILD=<${quoteWindowsArg(spec.pointer)}`,
-        `${quoteWindowsArg(spec.node)} ${quoteWindowsArg(`--env-file=${spec.envFile}`)} "%LONGMEMORY_BUILD%\\dist\\cli\\index.js" serve`,
-        ":pause",
-        "ping -n 4 127.0.0.1 >nul",
-        "goto run",
-    ]);
-}
-
-/**
  * The skill's PATH block in a shell startup file: `# <marker>` followed by `line`.
  * Managed lines are the marker line (with the export line right after it) and the first
  * skill version's export line, which ended in ` # <marker>`.
@@ -229,6 +203,7 @@ export function systemdUnit(spec) {
         "",
         "[Service]",
         "Type=simple",
+        "UMask=0077",
         `ExecStart=${systemdQuote(spec.execStart)}`,
         "Restart=always",
         "RestartSec=3",
@@ -252,6 +227,7 @@ export function launchAgentPlist(spec) {
         `<key>ProgramArguments</key><array><string>${xmlEscape(spec.program)}</string></array>`,
         "<key>RunAtLoad</key><true/>",
         "<key>KeepAlive</key><true/>",
+        "<key>Umask</key><integer>63</integer>",
         `<key>StandardOutPath</key><string>${xmlEscape(spec.log)}</string>`,
         `<key>StandardErrorPath</key><string>${xmlEscape(spec.log)}</string>`,
         "</dict></plist>",

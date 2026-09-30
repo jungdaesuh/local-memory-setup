@@ -1,13 +1,13 @@
 /**
  * Local memory setup: QMD (search) and CaviraOSS LongMemory (memory, built from the
- * current main of LONGMEMORY_REPO; the npm package "longmemory" is the old HSG server),
- * with Ollama for LongMemory's embeddings, user services that restart, and agent MCP wiring.
+ * reviewed commit of LONGMEMORY_REPO; the npm package "longmemory" is the old HSG server),
+ * with Ollama for LongMemory's embeddings, native stdio MCP wiring and private storage.
  *
  *   node ensure.mjs [--check]              health check, no changes, no network (default)
- *   node ensure.mjs --plan                 detect, resolve LongMemory main, print the plan; no changes
+ *   node ensure.mjs --plan                 detect and print the plan; no changes
  *   node ensure.mjs --apply --choices F    run the plan's pending actions for choices file F
  *   node ensure.mjs --apply --yes          same, with the plan's recommended choices
- *   node ensure.mjs --update               resolve main and run only the LongMemory actions
+ *   node ensure.mjs --update               install the reviewed LongMemory build
  *
  * stdout carries exactly one JSON document (none for a healthy --check).
  * Exit codes: 0 done or healthy, 1 failed or blocked, 2 needs an admin step, 3 unhealthy, 64 usage.
@@ -17,16 +17,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { retireWindowsMemoryTask } from "./task_retirement.mjs";
+import { installReviewedDependencies } from "./dependency_install.mjs";
+import { memoryClientSpecs, MCP_LAUNCH_FILES } from "./mcp_runtime.mjs";
+import { secureMemoryStorage, ensurePrivateDirectory } from "./private_storage.mjs";
+import { upsertStdioToml, upsertStdioJson } from "./stdio_config.mjs";
 import { NeedsAdmin, runApply } from "./apply_loop.mjs";
 import { UsageError, parseArgs } from "./cli_args.mjs";
-import { RC_FILES, WINDOWS_USER_PATH_READ, detectAgents, detectFacts, ollamaBinary, ollamaSystemUnit, qmdEntryIn, setupNode } from "./detect.mjs";
+import { RC_FILES, WINDOWS_USER_PATH_READ, detectFacts, opencodeMcpConfigFile, ollamaBinary, ollamaSystemUnit, qmdEntryIn, setupNode } from "./detect.mjs";
 import { instructedLongMemoryTools } from "./agent_instructions.mjs";
 import { applyAgentInstructions } from "./instructions_apply.mjs";
 import { ollamaStartStep, rebuildCommand } from "./executor_steps.mjs";
-import { longMemoryHealthy, ollamaModelNames, qmdHealthy } from "./health.mjs";
+import { ollamaModelNames } from "./health.mjs";
 import {
-    LONGMEMORY_HEALTH_URL,
-    LONGMEMORY_MCP_URL,
     LONGMEMORY_REPO,
     MARKER,
     MIN_NODE,
@@ -35,9 +38,8 @@ import {
     OLLAMA_PULL_URL,
     OLLAMA_TAGS_URL,
     OLLAMA_VERSION,
-    QMD_HEALTH_URL,
-    QMD_MCP_URL,
     QMD_VERSION,
+    LONGMEMORY_COMMIT,
     SERVICE_NAMES,
     assertSha256Match,
     fileSha256,
@@ -45,21 +47,19 @@ import {
     ollamaAdminCommand,
     ollamaInstallScriptUrl,
 } from "./layout.mjs";
-import { currentBuildDir, installLongMemoryCommit, pruneAfterSwitch, rollbackSwitch, runningLongMemory } from "./longmemory_build.mjs";
+import { currentBuildDir, installLongMemoryCommit, pruneAfterSwitch, runningLongMemory } from "./longmemory_build.mjs";
 import { longMemorySettings, renderEnvFile } from "./longmemory_env.mjs";
-import { appendServers, codexServers, grokServers, mcpAddArgs } from "./mcp_config.mjs";
 import { MODEL_TIERS } from "./model_choice.mjs";
 import { pullModelViaApi } from "./ollama_api.mjs";
 import { ollamaServicePlan } from "./ollama_plan.mjs";
 import { applyChoices, buildPlan, checkReport, effectiveQmdModels, foldersToAdd, isLongMemoryAction, longMemoryRestartPending, newNotesFolder, planActions, startSummary, stepsNeedingNewerNode } from "./plan.mjs";
-import { binEntry } from "./platform.mjs";
 import { commandPath, probeJson, run, waitFor } from "./proc.mjs";
 import { QMD_GLOBAL_INDEX_ARGS, qmdProcessEnv } from "./qmd_env.mjs";
 import { writeUserFile } from "./fs_util.mjs";
 import { collectionNameFor, qmdCollections, writeQmdModelsIfAbsent } from "./qmd_state.mjs";
-import { launchAgentPlist, systemdUnit, windowsTaskXml, withManagedPathBlock } from "./service_files.mjs";
-import { MCP_ADD_TIMEOUT_MS, OLLAMA_MODEL_BYTES, OLLAMA_ROCM_BYTES, QMD_PACKAGE_BYTES, downloadTimeoutMs, installTimeoutMs, ollamaInstallerBytes } from "./sizes.mjs";
-import { GATE_FILES, dispatcherText, longMemoryRunnerText, ollamaRunnerText, qmdRunnerText, rcPathLine, runnerFile } from "./service_specs.mjs";
+import { MANAGED_MARKER, launchAgentPlist, systemdUnit, windowsTaskXml, withManagedPathBlock } from "./service_files.mjs";
+import { OLLAMA_MODEL_BYTES, OLLAMA_ROCM_BYTES, downloadTimeoutMs, installTimeoutMs, ollamaInstallerBytes } from "./sizes.mjs";
+import { dispatcherText, ollamaRunnerText, rcPathLine, runnerFile } from "./service_specs.mjs";
 
 const L = layout();
 const platform = /** @type {"linux" | "darwin" | "win32"} */ (process.platform);
@@ -106,7 +106,7 @@ function writeIfChanged(file, content, mode) {
  * @param {import("./plan.mjs").Facts} facts
  */
 function qmdEntry(facts) {
-    const packageDir = facts.qmd.packageDir ?? L.qmdPackage;
+    const packageDir = qmdEntryIn(L.reviewedQmdPackage) !== null ? L.reviewedQmdPackage : facts.qmd.packageDir ?? L.qmdPackage;
     const entry = qmdEntryIn(packageDir);
     if (entry === null) throw new Error(`QMD is not installed in ${packageDir}.`);
     return entry;
@@ -168,20 +168,6 @@ function writeRunner(service, text) {
 }
 
 /**
- * Restart one of the setup's own services, so it loads rebuilt native modules.
- * @param {"qmd" | "longmemory" | "ollama"} service
- */
-function restartService(service) {
-    const names = SERVICE_NAMES[service];
-    if (platform === "linux") run("systemctl", ["--user", "restart", names.systemd]);
-    else if (platform === "darwin") run("launchctl", ["kickstart", "-k", `gui/${os.userInfo().uid}/${names.launchd}`]);
-    else {
-        run("schtasks", ["/End", "/TN", names.task], { allowFail: true });
-        run("schtasks", ["/Run", "/TN", names.task]);
-    }
-}
-
-/**
  * Rebuild a component's native modules for `node`, then restart its service when it
  * is the setup's own. npm next to that Node is the matching npm; the Node's directory
  * also goes first on PATH for everything the rebuild runs.
@@ -190,9 +176,7 @@ function restartService(service) {
  */
 function rebuildNative(component, ctx) {
     const beside = path.join(path.dirname(ctx.node), platform === "win32" ? "npm.cmd" : "npm");
-    const pnpmJson = path.join(L.pnpmPackage, "package.json");
-    const pnpmEntry = fs.existsSync(pnpmJson) ? path.join(L.pnpmPackage, binEntry(JSON.parse(fs.readFileSync(pnpmJson, "utf8")).bin, "pnpm")) : "";
-    if (component === "longmemory" && pnpmEntry === "") throw new Error(`pnpm is missing from ${L.tools}; run the plan again to rebuild LongMemory.`);
+
     /** @type {string} */
     let sourceDir;
     if (component === "longmemory") {
@@ -200,18 +184,10 @@ function rebuildNative(component, ctx) {
         if (dir === null) throw new Error("LongMemory has no current build to rebuild.");
         sourceDir = dir;
     } else {
-        sourceDir = L.qmdPackage;
+        sourceDir = L.reviewedQmdPackage;
     }
-    const command = rebuildCommand(component, {
-        L: { qmdPackage: L.qmdPackage, sourceDir },
-        nodeBin: ctx.node,
-        npm: fs.existsSync(beside) ? beside : "npm",
-        pnpmEntry,
-        pathEnv: process.env.PATH ?? "",
-        delimiter: path.delimiter,
-    });
+    const command = rebuildCommand(component, { L: { qmdPackage: L.reviewedQmdPackage, qmdRoot: L.qmdRoot, sourceDir }, nodeBin: ctx.node, npm: fs.existsSync(beside) ? beside : "npm", pathEnv: process.env.PATH ?? "", delimiter: path.delimiter });
     run(command.command, command.args, { cwd: command.cwd, env: { ...process.env, CI: "1", PATH: command.pathEnv }, stream: true, timeoutMs: installTimeoutMs(0) });
-    if (ctx.facts.services[component]) restartService(component);
 }
 
 /* ---------------------------------------------------------------- actions */
@@ -223,32 +199,22 @@ function rebuildNative(component, ctx) {
  * @type {Record<string, (ctx: Context) => Promise<void>>}
  */
 const EXECUTORS = {
-    "install-qmd": async ({ node, facts }) => {
-        // The plan installs QMD only where none exists; an existing QMD is adopted or blocks the plan.
-        if (qmdEntryIn(L.qmdPackage) !== null) throw new Error(`A QMD appeared in ${L.qmdPackage} after planning; run the plan again.`);
-        // With the setup's Node first on PATH, npm builds QMD's native modules for it.
-        run("npm", ["install", "-g", "--prefix", L.prefix, `@tobilu/qmd@${QMD_VERSION}`], {
-            env: { ...process.env, PATH: `${path.dirname(node)}${path.delimiter}${process.env.PATH ?? ""}` },
-            stream: true,
-            timeoutMs: installTimeoutMs(QMD_PACKAGE_BYTES[facts.platform] ?? QMD_PACKAGE_BYTES.linux),
-        });
-        // Ownership: only a QMD this setup installed is ever rebuilt (plan.mjs rebuildAction).
-        writeIfChanged(L.qmdInstallStamp, `${JSON.stringify({ version: QMD_VERSION, installedBy: MARKER }, null, 2)}\n`);
+    "secure-storage": async () => secureMemoryStorage(L, platform),
+    "install-qmd": async ({ node }) => {
+        const dependencyFingerprint = installReviewedDependencies("qmd", L.qmdRoot, node);
+        writeIfChanged(L.qmdInstallStamp, `${JSON.stringify({ version: QMD_VERSION, installedBy: MARKER, dependencyFingerprint }, null, 2)}\n`, 0o600);
     },
 
     "rebuild-qmd": async (ctx) => rebuildNative("qmd", ctx),
     "rebuild-longmemory": async (ctx) => rebuildNative("longmemory", ctx),
 
-    "install-longmemory": async ({ node, facts, choices }) => {
-        const sha = facts.longmemory.main;
-        if (sha === undefined) throw new Error("LongMemory main was not resolved; run the plan again.");
-        const tier = MODEL_TIERS[choices.modelTier].longmemory;
+    "install-longmemory": async ({ node, facts }) => {
+        const sha = LONGMEMORY_COMMIT;
         await installLongMemoryCommit({
             sha,
             node,
             repo: LONGMEMORY_REPO,
             platform,
-            settings: longMemorySettings({ dbPath: L.dbPath, model: tier.model, dimension: tier.dimension }),
             tools: instructedLongMemoryTools(),
             // The following start step restarts our service and prunes only after that succeeds.
             deferPrune: longMemoryRestartPending(facts),
@@ -317,14 +283,16 @@ const EXECUTORS = {
     },
 
     "write-settings": async ({ facts, choices, node, abi }) => {
+        backupDatabases(node);
         const tier = MODEL_TIERS[choices.modelTier];
         const settings = longMemorySettings({
             dbPath: L.dbPath,
             model: tier.longmemory.model,
             dimension: tier.longmemory.dimension,
         });
-        writeIfChanged(L.envPath, renderEnvFile(settings));
-        writeIfChanged(L.runtimePath, `${JSON.stringify({ node, modules: abi }, null, 2)}\n`);
+        writeIfChanged(L.envPath, renderEnvFile(settings), 0o600);
+        writeIfChanged(L.runtimePath, `${JSON.stringify({ node, modules: abi, qmdEntry: qmdEntry(facts), paths: L }, null, 2)}\n`, 0o600);
+        for (const name of MCP_LAUNCH_FILES) writeIfChanged(path.join(L.gateDir, name), fs.readFileSync(path.join(SCRIPTS_DIR, name)), 0o600);
         writeIfChanged(L.dispatcher, dispatcherText({ node, qmdEntry: qmdEntry(facts), gpu: facts.hardware.gpu, platform }), 0o755);
 
         if (facts.qmd.foreignCommand !== undefined) {
@@ -362,48 +330,15 @@ const EXECUTORS = {
         writeQmdModelsIfAbsent(L.qmdIndexConfig, effectiveQmdModels(facts, choices.modelTier));
     },
 
-    "start-qmd": async ({ facts, node }) => {
-        registerService("qmd", writeRunner("qmd", qmdRunnerText({ node, qmdEntry: qmdEntry(facts), gpu: facts.hardware.gpu, platform })), []);
-        await waitFor("QMD", async () => qmdHealthy(await probeJson(QMD_HEALTH_URL)), 60);
+    "start-qmd": async () => retireMemoryService("qmd"),
+    "start-longmemory": async () => {
+        retireMemoryService("longmemory");
+        pruneAfterSwitch(L, platform);
     },
-
-    "start-longmemory": async ({ choices, node, facts }) => {
-        const gateChanged = GATE_FILES.map((name) => writeIfChanged(path.join(L.gateDir, name), fs.readFileSync(path.join(SCRIPTS_DIR, name)))).some(Boolean);
-        const model = MODEL_TIERS[choices.modelTier].longmemory.model;
-        const runnerChanged = writeRunner("longmemory", longMemoryRunnerText({ node, L, model, platform }));
-        const ownOllamaUnit = platform === "linux" && ollamaServicePlan({ platform, systemUnitLoaded: ollamaSystemUnit().loaded }).owner === "skill" && fs.existsSync(path.join(L.systemdUserDir, SERVICE_NAMES.ollama.systemd));
-        // A switch leaves the runner path the same (it execs `current`), so the unit must still restart.
-        const switched = fs.existsSync(L.switchMarker);
-        const sha = facts.longmemory.main ?? "unknown";
-        try {
-            registerService("longmemory", runnerChanged || gateChanged || switched, ownOllamaUnit ? [SERVICE_NAMES.ollama.systemd] : []);
-            // The runner's gate may wait up to 120 s for Ollama before LongMemory starts.
-            await waitFor("LongMemory", async () => longMemoryHealthy(await probeJson(LONGMEMORY_HEALTH_URL)), 150);
-        } catch (error) {
-            const detail = error instanceof Error ? error.message : String(error);
-            const previous = rollbackSwitch(L, platform);
-            if (previous !== null) {
-                try {
-                    restartService("longmemory");
-                } catch (rollbackError) {
-                    const extra = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
-                    throw new Error(`LongMemory ${sha} failed the restart check: ${detail} Rolling back to the previous build also failed: ${extra}`);
-                }
-            }
-            throw new Error(`LongMemory ${sha} failed the restart check: ${detail}`);
-        }
-        try {
-            pruneAfterSwitch(L, platform);
-        } catch (error) {
-            const detail = error instanceof Error ? error.message : String(error);
-            throw new Error(`LongMemory ${sha} is running, but removing older builds failed: ${detail}`);
-        }
-    },
-
-    "connect-claude": async () => connectCli("claude"),
-    "connect-opencode": async () => connectCli("opencode"),
-    "connect-codex": async () => connectToml(L.codexConfig, codexServers),
-    "connect-grok": async () => connectToml(L.grokConfig, grokServers),
+    "connect-claude": async ({ node }) => connectAgent("claude", node),
+    "connect-opencode": async ({ node }) => connectAgent("opencode", node),
+    "connect-codex": async ({ node }) => connectAgent("codex", node),
+    "connect-grok": async ({ node }) => connectAgent("grok", node),
 
     "instructions-claude": async ({ choices }) => applyAgentInstructions("claude", L, choices, process.env),
     "instructions-codex": async ({ choices }) => applyAgentInstructions("codex", L, choices, process.env),
@@ -457,28 +392,62 @@ const EXECUTORS = {
     },
 };
 
-/**
- * Claude Code and OpenCode are connected through their own `mcp add`, which writes the
- * file each of them owns; a server name already present is left as it is.
- * @param {"claude" | "opencode"} agent
- */
-function connectCli(agent) {
-    const found = detectAgents(L, () => new Set([agent]));
-    if (found.problems[agent] !== undefined) throw new Error(found.problems[agent]);
-    const present = found.agents[agent];
-    if (!present.qmd) run(agent, mcpAddArgs(agent, "qmd", QMD_MCP_URL), { timeoutMs: MCP_ADD_TIMEOUT_MS });
-    if (!present.longmemory) run(agent, mcpAddArgs(agent, "longmemory", LONGMEMORY_MCP_URL), { timeoutMs: MCP_ADD_TIMEOUT_MS });
+/** Preserve original bytes privately before replacing a managed connection or service. */
+function backupFile(file) {
+    if (!fs.existsSync(file)) return;
+    const dir = path.join(L.configDir, "backups");
+    ensurePrivateDirectory(dir);
+    const target = path.join(dir, `${path.basename(file)}-${fileSha256(file)}`);
+    if (!fs.existsSync(target)) fs.writeFileSync(target, fs.readFileSync(file), { mode: 0o600, flag: "wx" });
 }
 
-/**
- * @param {string} file
- * @param {typeof codexServers} servers
- */
-function connectToml(file, servers) {
+/** Snapshot each existing store before a newly configured upstream can open it. */
+function backupDatabases(node) {
+    const sources = [L.dbPath, L.qmdIndexDb].filter(file => fs.existsSync(file));
+    if (sources.length === 0) return;
+    const dir = path.join(L.configDir, "backups", `databases-${Date.now()}-${process.pid}`);
+    ensurePrivateDirectory(dir);
+    const snapshots = sources.map((source, index) => {
+        const destination = path.join(dir, `${index}-${path.basename(source)}`);
+        run(node, [path.join(SCRIPTS_DIR, "backup_database.mjs"), source, destination], { timeoutMs: installTimeoutMs(0) });
+        return { source, destination, sha256: fileSha256(destination) };
+    });
+    writeIfChanged(path.join(dir, "manifest.json"), `${JSON.stringify(snapshots, null, 2)}\n`, 0o600);
+}
+
+/** Retire only a registration whose bytes identify it as setup-owned. */
+function retireMemoryService(service) {
+    if (platform === "win32") {
+        retireWindowsMemoryTask(L, service);
+        return;
+    }
+    const names = SERVICE_NAMES[service];
+    const file = platform === "linux" ? path.join(L.systemdUserDir, names.systemd)
+        : path.join(L.launchAgentsDir, `${names.launchd}.plist`);
+    if (!fs.existsSync(file)) return;
+    if (fs.lstatSync(file).isSymbolicLink()) throw new Error(`Symlinked service registration ${file} was left unchanged.`);
+    if (!fs.readFileSync(file, "utf8").includes(MANAGED_MARKER)) throw new Error(`Foreign service registration ${file} was left unchanged.`);
+    backupFile(file);
+    if (platform === "linux") {
+        run("systemctl", ["--user", "disable", "--now", names.systemd]);
+        fs.unlinkSync(file);
+        run("systemctl", ["--user", "daemon-reload"]);
+    } else {
+        const target = `gui/${os.userInfo().uid}/${names.launchd}`;
+        if (run("launchctl", ["print", target], { allowFail: true }).status === 0) run("launchctl", ["bootout", target]);
+        fs.unlinkSync(file);
+    }
+}
+
+function connectAgent(agent, node) {
+    const file = agent === "claude" ? L.claudeJson : agent === "codex" ? L.codexConfig : agent === "grok" ? L.grokConfig : opencodeMcpConfigFile(L);
     const current = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-    const next = appendServers(current, servers({ qmdUrl: QMD_MCP_URL, longMemoryUrl: LONGMEMORY_MCP_URL }));
-    if (next === current) return;
-    writeUserFile(file, next);
+    const specs = memoryClientSpecs(L, node);
+    const result = agent === "codex" || agent === "grok" ? upsertStdioToml(current, specs) : upsertStdioJson(current, agent, specs);
+    if (!result.ready) throw new Error(`Foreign or unsupported ${agent} memory configuration was left unchanged.`);
+    if (!result.changed) return;
+    backupFile(file);
+    writeUserFile(file, result.text);
 }
 
 /* ---------------------------------------------------------------- modes */
@@ -486,10 +455,13 @@ function connectToml(file, servers) {
 /**
  * @param {boolean} yes
  * @param {string | undefined} choicesFile
- * @param {boolean} updateOnly resolve main and run only the LongMemory actions; do not save choices
+ * @param {boolean} updateOnly install the reviewed LongMemory build; do not save choices
  */
 async function apply(yes, choicesFile, updateOnly) {
     const facts = await detectFacts(L, { probeAdmin: true, resolveMain: true });
+    if (updateOnly && (!facts.privateStorage || !facts.nativeRuntime || facts.services.longmemory)) {
+        throw new Blocked(["Legacy memory setup needs --plan and --apply before --update. Update leaves its services and client configurations unchanged."]);
+    }
     const plan = buildPlan(facts);
     const requested = applyChoices(plan, yes ? null : JSON.parse(fs.readFileSync(/** @type {string} */ (choicesFile), "utf8")));
     // Only folders QMD does not index yet must exist; an indexed folder that moved does not block a repair.
@@ -562,7 +534,7 @@ async function apply(yes, choicesFile, updateOnly) {
         );
     }
     if (updateOnly) {
-        emit({ status: "ready", updated: "longmemory", commit: runningLongMemory(L, platform)?.commit ?? null, longmemory: LONGMEMORY_MCP_URL });
+        emit({ status: "ready", updated: "longmemory", commit: runningLongMemory(L, platform)?.commit ?? null, longmemory: "stdio" });
         return;
     }
     const tier = MODEL_TIERS[choices.modelTier];
@@ -572,9 +544,9 @@ async function apply(yes, choicesFile, updateOnly) {
         qmdModel: effectiveQmdModels(facts, choices.modelTier).embed,
         longmemoryModel: tier.longmemory.model,
         longmemoryDimension: tier.longmemory.dimension,
-        qmd: QMD_MCP_URL,
-        longmemory: LONGMEMORY_MCP_URL,
-        startsAgain: startSummary(facts, choices),
+        qmd: "stdio",
+        longmemory: "stdio",
+        startsAgain: startSummary(await detectFacts(L, { probeAdmin: false, resolveMain: false }), choices),
         env: L.envPath,
     });
 }
@@ -603,6 +575,7 @@ async function main() {
 // (An `import.meta.url === argv[1]` guard would silently skip main() whenever the
 // skill is reached through a symlink, because import.meta.url is the real path.)
 try {
+    if (platform !== "win32") process.umask(0o077);
     process.exitCode = await main();
 } catch (error) {
     if (error instanceof NeedsAdmin) {
