@@ -45,17 +45,17 @@ export const MODEL_TIERS = {
     small: {
         qmd: QMD_MODELS.gemma,
         longmemory: LONGMEMORY_MODELS.nomic,
-        description: "Smallest download and fastest on older or low-memory computers. Search quality is basic, English-first.",
+        description: "For computers with under 8 GB of memory. Note search: a small, fast model, best with English. Agent memory: a light model, best with English. Smallest download.",
     },
     medium: {
         qmd: QMD_MODELS.qwen06,
         longmemory: LONGMEMORY_MODELS.bge,
-        description: "Balanced. Good search quality in many languages and runs well on most laptops.",
+        description: "Fits most laptops. Note search: a mid-size model with good results in many languages. Agent memory: a multilingual model that recalls well across languages.",
     },
     large: {
         qmd: QMD_MODELS.qwen8,
         longmemory: LONGMEMORY_MODELS.bge,
-        description: "Best search quality. Needs 32 GB of memory and a strong graphics card; each search takes a little longer.",
+        description: "For computers with 32 GB of memory and either a graphics card with 12 GB or more or an Apple Silicon chip. Note search: the most accurate model, a little slower per search. Agent memory: the same multilingual model as Medium. Largest download.",
     },
 };
 

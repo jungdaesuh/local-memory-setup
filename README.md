@@ -21,8 +21,12 @@ It works with **Claude Code, Codex, Grok and OpenCode** on **Linux, macOS and Wi
    | Codex | `~/.agents/skills/local-memory-setup` |
    | Grok | `~/.grok/skills/local-memory-setup` |
 
-3. Start a new session. The agent explains what it will install and asks:
-   **"Install with recommended settings?"** Choose *Yes*, *Customize*, or *Not now*.
+3. Start a new session. The agent explains what it will install and asks two things:
+   - **Which model size?** *Small*, *Medium* or *Large*. One size sets both the note-search
+     and the agent-memory model; the agent recommends the one that fits your computer and
+     says why.
+   - **Install now?** *Yes*, *Customize* (choose agents, folders, and start at boot or login),
+     or *Not now*.
 
 That's it. Nothing is installed until you say yes.
 

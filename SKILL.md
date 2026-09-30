@@ -48,19 +48,33 @@ Run `SCRIPT --check`. It changes nothing, never calls sudo, and does not use the
      including whether that differs from the running build. The install downloads the programs and models;
    - that each connected agent gets short global instructions telling it when to recall
      and what to store (the `instructions-<agent>` actions).
-3. Ask ONE question with the agent's question tool (Claude Code: AskUserQuestion; Grok:
-   ask_user_question; Codex and OpenCode: ask in chat):
-   "Install with recommended settings?" with the options **Yes**, **Customize**, **Not now**.
-   - **Yes**: run `SCRIPT --apply --yes` (`--yes` means the saved choices when a setup exists,
-     otherwise the plan's `recommended` choices).
-   - **Customize**: ask at most these four questions, with the recommended answer first:
+3. Explain the model size. One size sets both the note-search model (QMD) and the
+   agent-memory model (LongMemory). In plain words, never by model name:
+   - what the recommended size (`recommended.modelTier`) means, and why it fits this
+     computer: say the memory in `hardware.ramBytes` (GB) and the graphics memory in
+     `hardware.vramBytes`, or that it is an Apple Silicon Mac (`hardware.appleSilicon`);
+   - for each entry of `options.modelTier`: its `description` (it covers both search and
+     memory) and its `approxDownloadBytes` in GB.
+   If `detected.lockedTiers` is not null, memories already exist: offer only those sizes
+   and say why (a different memory model could not read the stored memories).
+4. Ask with the agent's question tool (Claude Code: AskUserQuestion with both questions in
+   one call; Grok: ask_user_question; Codex and OpenCode: ask in chat):
+   - "Which model size?" with each allowed size as an option, the recommended one first
+     and labelled "(Recommended)". Skip this question when only one size is allowed.
+   - "Install now?" with the options **Yes**, **Customize**, **Not now**.
+   Then:
+   - **Yes** with the recommended size: run `SCRIPT --apply --yes` (`--yes` means the saved
+     choices when a setup exists, otherwise the plan's `recommended` choices).
+   - **Yes** with another size: write a choices file (format below) that is
+     `recommended` with `modelTier` set to their size, and run
+     `SCRIPT --apply --choices <that file>`.
+   - **Customize**: keep their size, and ask at most these three questions, with the
+     recommended answer first:
      1. Which agents to connect (multi-select from `options.agents`; preselect `recommended.agents`).
-     2. Model size, described by disk and speed only, never by model name: for each entry of
-        `options.modelTier`, its `approxDownloadBytes` in GB and its `description`.
-     3. Linux only (`options.bootMode` not empty): start when the computer starts, or when
+     2. Linux only (`options.bootMode` not empty): start when the computer starts, or when
         they log in. Starting at boot needs the admin password once unless the plan shows
         `enable-boot-start` without `needsAdmin`.
-     4. Folders for QMD to search. Default: `recommended.qmdFolders`: `~/notes` when it exists,
+     3. Folders for QMD to search. Default: `recommended.qmdFolders`: `~/notes` when it exists,
         or when QMD has no folders yet (apply then creates `~/notes` with a short README);
         otherwise none, and QMD's existing folders stay as they are.
      Then write the answers as a choices file (format below) and run
