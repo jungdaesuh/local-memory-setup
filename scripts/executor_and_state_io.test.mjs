@@ -17,7 +17,6 @@ import { layout } from "./layout.mjs";
 import { pullModelViaApi } from "./ollama_api.mjs";
 import { QMD_GLOBAL_INDEX_ARGS, qmdProcessEnv } from "./qmd_env.mjs";
 import { qmdConfiguredModels, qmdModelCacheFile, writeQmdModelsIfAbsent } from "./qmd_state.mjs";
-import { qmdRunnerText } from "./service_specs.mjs";
 
 const GEMMA = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const RERANK = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
@@ -149,9 +148,10 @@ test("start-ollama leaves a foreign server alone and re-registers the setup's ow
 
 test("native modules are rebuilt for the setup's Node, with its directory first on PATH", () => {
     const L = { qmdPackage: "/h/.local/lib/node_modules/@tobilu/qmd", sourceDir: "/h/.local/share/local-memory-setup/LongMemory" };
-    const spec = { L, nodeBin: "/opt/node22/bin/node", npm: "/opt/node22/bin/npm", pnpmEntry: "/t/pnpm/bin/pnpm.mjs", pathEnv: "/usr/bin:/bin", delimiter: ":" };
+    const spec = { L, nodeBin: "/opt/node22/bin/node", npm: "/opt/node22/bin/npm", pathEnv: "/usr/bin:/bin", delimiter: ":" };
     assert.deepEqual(rebuildCommand("qmd", spec), { command: "/opt/node22/bin/npm", args: ["rebuild"], cwd: L.qmdPackage, pathEnv: "/opt/node22/bin:/usr/bin:/bin" });
-    assert.deepEqual(rebuildCommand("longmemory", spec), { command: "/opt/node22/bin/node", args: ["/t/pnpm/bin/pnpm.mjs", "rebuild"], cwd: L.sourceDir, pathEnv: "/opt/node22/bin:/usr/bin:/bin" });
+    assert.deepEqual(rebuildCommand("longmemory", spec), { command: "/opt/node22/bin/npm", args: ["rebuild"], cwd: L.sourceDir, pathEnv: "/opt/node22/bin:/usr/bin:/bin" });
+    assert.equal(nativeModuleFile("qmd", { ...L, qmdRoot: "/reviewed" }), path.join("/reviewed", "node_modules", "better-sqlite3", "build", "Release", "better_sqlite3.node"));
     assert.equal(nativeModuleFile("qmd", L), path.join(L.qmdPackage, "node_modules", "better-sqlite3", "build", "Release", "better_sqlite3.node"));
 });
 
@@ -174,7 +174,6 @@ test("QMD commands run with the setup's Node first on PATH and pinned to the glo
     assert.equal(execFileSync("/bin/sh", ["-c", "node"], { env, encoding: "utf8" }).trim(), "setup");
     assert.equal(env.QMD_FORCE_CPU, "1");
     assert.deepEqual([...QMD_GLOBAL_INDEX_ARGS], ["--index", "index"]);
-    assert.match(qmdRunnerText({ node: "/n/node", qmdEntry: "/q/bin/qmd", gpu: "none", platform: "linux" }), /'--index' 'index' 'mcp'/);
 });
 
 /* ------------------------------------------------------------ QMD model cache names */

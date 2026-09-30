@@ -1,20 +1,17 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { freeBytesAt } from "./detect.mjs";
 import { longMemoryGateReady } from "./health.mjs";
-import { OLLAMA_ORIGIN, layout } from "./layout.mjs";
+import { OLLAMA_ORIGIN } from "./layout.mjs";
 import { LONGMEMORY_ENV_KEYS, longMemorySettings, parseEnvFile, renderEnvFile } from "./longmemory_env.mjs";
 import { waitFor } from "./proc.mjs";
-import { runnerScript } from "./service_files.mjs";
-import { longMemoryRunnerText } from "./service_specs.mjs";
 
-test("the LongMemory settings pin 127.0.0.1, carry no key, and hold only variables serve reads", () => {
+test("the LongMemory settings pin 127.0.0.1, disable HTTP, carry no key, and hold only variables serve reads", () => {
     const settings = Object.fromEntries(longMemorySettings({ dbPath: "/d/lm.db", model: "bge-m3", dimension: 1024 }));
     assert.equal(settings.LONGMEMORY_HOST, "127.0.0.1");
+    assert.equal(settings.LONGMEMORY_MCP_HTTP, "false");
     assert.equal(settings.LONGMEMORY_OLLAMA_URL, OLLAMA_ORIGIN);
     assert.equal(settings.LONGMEMORY_EMBEDDING_DIMENSION, "1024");
     assert.ok(!("LONGMEMORY_PROJECT_ID" in settings) && !("LONGMEMORY_USER_ID" in settings));
@@ -24,30 +21,6 @@ test("the LongMemory settings pin 127.0.0.1, carry no key, and hold only variabl
     const text = renderEnvFile(Object.entries(settings));
     assert.deepEqual(parseEnvFile(text), settings);
     assert.throws(() => renderEnvFile([["LONGMEMORY_DB_PATH", "a\nb"]]), /line break/);
-});
-
-test("the LongMemory runner unsets inherited settings, so the env file wins", { skip: process.platform === "win32" }, () => {
-    const L = layout("linux", "/home/a");
-    const text = longMemoryRunnerText({ node: "/usr/bin/node", L, model: "bge-m3", platform: "linux" });
-    for (const key of LONGMEMORY_ENV_KEYS) assert.match(text, new RegExp(`^unset ${key}$`, "m"));
-    assert.match(text, /'http:\/\/127\.0\.0\.1:11434\/api\/tags' 'bge-m3' '120' \|\| exit 1/);
-    assert.ok(text.includes(`exec '/usr/bin/node' '--env-file=${L.envPath}' '${L.currentLink}/dist/cli/index.js' 'serve'`));
-    // Run the same shape: inherited settings, a host, or a key from the service manager must not reach the server.
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lms-runner-"));
-    const script = path.join(dir, "r.sh");
-    fs.writeFileSync(script, runnerScript({ env: LONGMEMORY_ENV_KEYS.map((key) => [key, null]), pathPrepend: null, gate: null, argv: ["/usr/bin/env"] }, "linux"));
-    const inherited = { PATH: process.env.PATH, LONGMEMORY_PORT: "9999", LONGMEMORY_HOST: "0.0.0.0", LONGMEMORY_API_KEY: "k", OM_API_KEY: "k", KEEP: "1" };
-    const out = spawnSync("/bin/sh", [script], { encoding: "utf8", env: inherited });
-    for (const name of ["LONGMEMORY_PORT", "LONGMEMORY_HOST", "LONGMEMORY_API_KEY", "OM_API_KEY"]) assert.doesNotMatch(out.stdout, new RegExp(`^${name}=`, "m"));
-    assert.match(out.stdout, /^KEEP=1$/m);
-});
-
-test("the Windows LongMemory runner reads the current pointer before each serve", () => {
-    const L = layout("win32", "C:\\Users\\a");
-    const text = longMemoryRunnerText({ node: "C:\\node\\node.exe", L, model: "bge-m3", platform: "win32" });
-    assert.ok(text.includes(`set /p LONGMEMORY_BUILD=<"${L.currentPointer}"`));
-    assert.match(text, /"%LONGMEMORY_BUILD%\\dist\\cli\\index\.js" serve/);
-    assert.match(text, /--env-file=/);
 });
 
 test("the Ollama gate waits for the model, not only for the port", () => {

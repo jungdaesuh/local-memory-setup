@@ -3,12 +3,12 @@
  * choices. `--plan` prints it, `--apply` executes the pending actions of the same
  * plan, and `--check` reports the pending actions of the saved choices as problems.
  *
- * Monotonic by construction: an existing QMD, Ollama, or server the skill did not set
- * up is adopted or left alone, never replaced; a conflict it cannot resolve becomes a
- * `blocker` that stops apply before any change.
+ * Foreign QMD installs and service registrations are never adopted; this setup replaces
+ * only its own legacy QMD and retires only its marked HTTP services. Unresolved conflicts
+ * become blockers before apply changes anything.
  */
 import path from "node:path";
-import { MIN_NODE, OLLAMA_VERSION, QMD_COMPATIBLE_VERSIONS, QMD_VERSION, ollamaAdminCommand } from "./layout.mjs";
+import { LONGMEMORY_COMMIT, MIN_NODE, OLLAMA_VERSION, QMD_VERSION, ollamaAdminCommand } from "./layout.mjs";
 import { shortSha } from "./longmemory_build.mjs";
 import { nodeAtLeast } from "./platform.mjs";
 import { MODEL_TIERS, QMD_DEFAULT_MODELS, TIER_IDS, recommendTier } from "./model_choice.mjs";
@@ -39,15 +39,15 @@ const AGENT_LABELS = { claude: "Claude Code", codex: "Codex", grok: "Grok", open
  * documents without vectors, qmd.nativeAbi/longmemory.nativeAbi/nodeAbi unless the native
  * module or the setup's Node was found, instructions before detection has looked (tests),
  * longmemory.envFile/envModel/dbExists before detection has
- * looked (tests), longmemory.main unless detection resolved refs/heads/main,
+ * looked (tests), longmemory.main is the pinned source commit,
  * longmemory.current unless a finished build is current,
  * longmemory.storedMemories unless the database was counted,
  * longmemory.memoryCountUnknown unless a database exists that could not be counted,
- * staleServices unless one of the setup's own services runs an out-of-date runner,
+ * staleServices unless the setup-owned Ollama runner is out of date,
  * withoutSystemd unless Linux runs without systemd as PID 1, selfLingerAllowed unless
  * polkit lets an active user enable linger.
- * services.<name> is true when the service is the setup's own registration (unit, agent,
- * or task), whether or not its runner is current.
+ * services.<name> is true when the setup's own registration exists, even when inactive;
+ * foreignServices lists unmarked QMD/LongMemory registrations at the same service name.
  * @typedef {{
  *   platform: "linux" | "darwin" | "win32",
  *   arch: string,
@@ -59,13 +59,14 @@ const AGENT_LABELS = { claude: "Claude Code", codex: "Codex", grok: "Grok", open
  *   lingerEnabled: boolean,
  *   selfLingerAllowed?: boolean,
  *   withoutSystemd?: boolean,
- *   staleServices?: ("qmd" | "longmemory" | "ollama")[],
+ *   staleServices?: ("ollama")[],
  *   brewAvailable: boolean,
  *   agents: Record<AgentId, { installed: boolean, qmd: boolean, longmemory: boolean }>,
  *   nodeAbi?: string,
  *   qmd: {
  *     version: string | null, healthy: boolean, collectionPaths: string[], configModels?: QmdModels, foreignCommand?: string,
  *     unembeddedFolders?: string[], embeddingUnknown?: boolean, embeddingUnchecked?: boolean, nativeAbi?: string, installedBySetup?: boolean,
+ *     reviewed?: boolean, reviewedOwned?: boolean,
  *     packageDir?: string,
  *     modelCache?: { cached: string[], unknown: string[] },
  *   },
@@ -81,6 +82,9 @@ const AGENT_LABELS = { claude: "Claude Code", codex: "Codex", grok: "Grok", open
  *     ollamaApp: boolean, brewService: boolean,
  *   },
  *   services: { qmd: boolean, longmemory: boolean, ollama: boolean },
+ *   foreignServices?: ("qmd" | "longmemory")[],
+ *   privateStorage?: boolean,
+ *   nativeRuntime?: boolean,
  *   settingsWritten: boolean,
  *   agentProblems?: Partial<Record<AgentId, string>>,
  *   saved: unknown,
@@ -316,7 +320,7 @@ export function ollamaForeign(facts) {
     const owner = predictedOllamaOwner(facts).owner;
     if (!facts.ollama.healthy) return false;
     if (owner === "skill") return !facts.services.ollama;
-    // A setup-owned service with an old runner is the setup's own, not foreign; see serverAction.
+    // A setup-owned service with an old runner is the setup's own, not foreign.
     if (owner === "system-unit") return !facts.ollama.systemUnit.active;
     return false;
 }
@@ -334,31 +338,28 @@ function action(fields) {
     return { needsAdmin: false, adminCommand: null, downloadBytes: 0, blocker: null, ...fields };
 }
 
-/**
- * One server per port: a healthy server this setup did not register (a colleague's
- * own QMD, say) is left alone, because a second instance would crash-loop on the port.
- * @param {Facts} facts
- * @param {string} id
- * @param {string} label
- * @param {boolean} healthy
- * @param {boolean} registered
- * @param {string} startWhen
- */
-function serverAction(facts, id, label, healthy, registered, startWhen) {
-    const service = /** @type {"qmd" | "longmemory"} */ (id.replace("start-", ""));
-    const stale = registered && (facts.staleServices ?? []).includes(service);
-    const Label = `${label[0].toUpperCase()}${label.slice(1)}`;
+/** Native memory servers run only inside an agent's stdio connection. */
+function qmdServerAction(facts) {
+    const unmanagedHttp = facts.qmd.healthy && !facts.services.qmd;
+    const foreignRegistration = (facts.foreignServices ?? []).includes("qmd");
     return action({
-        id,
-        summary: stale
-            ? `Update ${label} to this setup's current settings and restart it.`
-            : healthy && !registered
-              ? `Leave ${label} as it is: it is already running, started outside this setup.`
-              : `Start ${label} and have it start again ${startWhen}.`,
-        alreadyDone: healthy && !stale,
-        blocker: (!healthy || stale) && facts.withoutSystemd === true ? NO_SYSTEMD : null,
-        problem: stale ? `${Label} runs out-of-date settings.` : `${Label} is not running.`,
+        id: "start-qmd",
+        summary: facts.services.qmd
+            ? "Retire this setup's old QMD HTTP service; agents will launch QMD over a private stdio connection."
+            : "Prepare reviewed QMD for private stdio connections from agents.",
+        alreadyDone: qmdServerReady(facts),
+        blocker: foreignRegistration
+            ? "An unmarked service registration occupies this setup's QMD service name. Resolve it manually before migrating to stdio."
+            : unmanagedHttp
+              ? "A QMD HTTP server is answering outside this setup's managed service. Stop that listener before migrating memory access to stdio."
+              : null,
+        problem: "The reviewed QMD stdio runtime is missing or the setup's old HTTP service is still registered.",
     });
+}
+
+/** @param {Facts} facts */
+function qmdServerReady(facts) {
+    return facts.nativeRuntime === true && facts.qmd.reviewed === true && !facts.services.qmd && !(facts.foreignServices ?? []).includes("qmd") && !(facts.qmd.healthy && !facts.services.qmd);
 }
 
 /** LongMemory steps `--update` runs, and the only ones it treats as remaining afterwards. */
@@ -370,96 +371,57 @@ export function isLongMemoryAction(id) {
 }
 
 /**
- * The setup's own LongMemory service must restart when it is down, its runner is stale,
- * or it is not the resolved main. A healthy server this setup did not register is left
- * alone: a second one would crash-loop on the port. Without a resolved main (the offline
- * check), "behind" is not a reason to restart.
+ * Native LongMemory is current only when the reviewed build and launcher are ready and
+ * no legacy listener can continue exposing the shared database over unauthenticated HTTP.
  * @param {Facts} facts
  */
 export function longMemoryRestartPending(facts) {
-    const registered = facts.services.longmemory;
-    const stale = registered && (facts.staleServices ?? []).includes("longmemory");
-    const behind = facts.longmemory.main !== undefined && facts.longmemory.current !== facts.longmemory.main;
-    if (registered) return !facts.longmemory.healthy || stale || behind;
-    return !facts.longmemory.healthy;
+    const unmanagedHttp = facts.longmemory.healthy && !facts.services.longmemory;
+    const foreignRegistration = (facts.foreignServices ?? []).includes("longmemory");
+    const staleBuild = !facts.longmemory.built || facts.longmemory.current !== (facts.longmemory.main ?? LONGMEMORY_COMMIT);
+    return facts.nativeRuntime !== true || staleBuild || facts.services.longmemory || unmanagedHttp || foreignRegistration;
 }
 
 /**
- * Build the resolved main when detection fetched it; otherwise only look at the running build.
+ * Build the reviewed source commit and dependency graph when the current stamp differs.
  * @param {Facts} facts
  */
 function longMemoryInstallAction(facts) {
-    const { built, main, current } = facts.longmemory;
-    if (main === undefined) {
-        return action({
-            id: "install-longmemory",
-            summary: "Download and build LongMemory, a memory server your AI agents save to and recall from.",
-            downloadBytes: built ? 0 : LONGMEMORY_BUILD_BYTES,
-            alreadyDone: built,
-            problem: "LongMemory is not built.",
-        });
-    }
+    const { built, current } = facts.longmemory;
+    const main = facts.longmemory.main ?? LONGMEMORY_COMMIT;
     const short = shortSha(main);
     const differs = !built || current !== main;
-    const running = current === undefined ? "No LongMemory build is running." : `The running build is ${shortSha(current)}.`;
     return action({
         id: "install-longmemory",
-        summary: differs ? `Build LongMemory main @ ${short}. ${running}` : `LongMemory main @ ${short} is the running build.`,
+        summary: differs ? `Build pinned LongMemory @ ${short} with its reviewed dependency graph.` : `Pinned LongMemory @ ${short} and its reviewed dependency graph are installed.`,
         downloadBytes: differs ? LONGMEMORY_BUILD_BYTES : 0,
         alreadyDone: !differs,
-        problem: `LongMemory is not running main @ ${short}.`,
+        problem: `The pinned LongMemory build or its reviewed dependency graph is missing (${short}).`,
     });
 }
 
 /**
- * Restart onto the build install-longmemory just switched to. A foreign healthy server
- * stays already done even when main is ahead of anything this setup built.
+ * Retire this setup's old HTTP service and leave native LongMemory available to stdio
+ * launchers. An unmanaged HTTP listener blocks this security migration.
  * @param {Facts} facts
- * @param {string} startWhen
  */
-function longMemoryServerAction(facts, startWhen) {
-    const registered = facts.services.longmemory;
-    const healthy = facts.longmemory.healthy;
-    const stale = registered && (facts.staleServices ?? []).includes("longmemory");
+function longMemoryServerAction(facts) {
     const pending = longMemoryRestartPending(facts);
-    const behind = facts.longmemory.main !== undefined && facts.longmemory.current !== facts.longmemory.main;
-    const short = facts.longmemory.main === undefined ? null : shortSha(facts.longmemory.main);
-    const summary =
-        behind && registered && short !== null
-            ? `Restart the LongMemory server on LongMemory main @ ${short}.`
-            : stale
-              ? "Update the LongMemory server to this setup's current settings and restart it."
-              : healthy && !registered
-                ? "Leave the LongMemory server as it is: it is already running, started outside this setup."
-                : `Start the LongMemory server and have it start again ${startWhen}.`;
-    const problem =
-        behind && short !== null
-            ? `The LongMemory server is not running main @ ${short}.`
-            : stale
-              ? "The LongMemory server runs out-of-date settings."
-              : "The LongMemory server is not running.";
+    const unmanagedHttp = facts.longmemory.healthy && !facts.services.longmemory;
+    const foreignRegistration = (facts.foreignServices ?? []).includes("longmemory");
     return action({
         id: "start-longmemory",
-        summary,
+        summary: facts.services.longmemory
+            ? "Retire this setup's old LongMemory HTTP service; agents will launch the reviewed server over stdio."
+            : "Prepare reviewed LongMemory for private stdio connections from agents.",
         alreadyDone: !pending,
-        blocker: pending && facts.withoutSystemd === true ? NO_SYSTEMD : null,
-        problem,
+        blocker: foreignRegistration
+            ? "An unmarked service registration occupies this setup's LongMemory service name. Resolve it manually before migrating to stdio."
+            : unmanagedHttp
+              ? "A LongMemory HTTP server is answering outside this setup's managed service. Stop that listener before migrating memory access to stdio."
+              : null,
+        problem: "The reviewed LongMemory stdio runtime is missing or the setup's old HTTP service is still registered.",
     });
-}
-
-/**
- * Parts of a dotted version, for ordering releases.
- * @param {string} version
- */
-function versionParts(version) {
-    return version.split(/[.+-]/).slice(0, 3).map(Number);
-}
-
-/** @param {string} a @param {string} b */
-function newerThan(a, b) {
-    const [x, y] = [versionParts(a), versionParts(b)];
-    for (let i = 0; i < 3; i += 1) if (x[i] !== y[i]) return x[i] > y[i];
-    return false;
 }
 
 /**
@@ -473,7 +435,7 @@ function rebuildAction(facts, component) {
     const label = component === "qmd" ? "QMD" : "LongMemory";
     const current = built === undefined || facts.nodeAbi === undefined || built === facts.nodeAbi;
     // A QMD the user installed is never rebuilt: its own service or shell may run it with the Node it was built for.
-    const adopted = component === "qmd" && facts.qmd.installedBySetup !== true;
+    const adopted = component === "qmd" && facts.qmd.installedBySetup !== true && facts.qmd.reviewedOwned !== true;
     return action({
         id: `rebuild-${component}`,
         summary: current
@@ -548,47 +510,28 @@ function instructionsAction(facts, choices, id) {
 
 /** @param {Facts} facts */
 function qmdInstallAction(facts) {
-    const { version, foreignCommand } = facts.qmd;
-    // Where the adopted QMD lives: ~/.local, or wherever `npm install -g` put it (its README's way).
-    const where = facts.qmd.packageDir ?? "~/.local";
-    if (version !== null && QMD_COMPATIBLE_VERSIONS.includes(version)) {
-        return action({ id: "install-qmd", summary: `Use the QMD ${version} already installed in ${where}.`, alreadyDone: true, problem: "" });
-    }
-    const newest = QMD_COMPATIBLE_VERSIONS.reduce((a, b) => (newerThan(b, a) ? b : a));
-    if (version !== null && newerThan(version, newest)) {
-        // Decided by the version alone, so a newer QMD that is down gets start-qmd, not a blocker.
+    const { version, foreignCommand, packageDir, reviewedOwned, reviewed } = facts.qmd;
+    if (reviewed === true) return action({ id: "install-qmd", summary: `Use reviewed QMD ${QMD_VERSION} and its pinned dependency graph.`, alreadyDone: true, problem: "" });
+    const setupOwnedLegacy = facts.qmd.installedBySetup === true;
+    const foreignInstall = (version !== null || packageDir !== undefined || foreignCommand !== undefined) && !setupOwnedLegacy && reviewedOwned !== true;
+    if (foreignInstall) {
+        const location = packageDir ?? foreignCommand ?? "an unknown location";
         return action({
             id: "install-qmd",
-            summary: `Use the QMD ${version} already installed in ${where}. It is newer than the versions this skill was checked with (${QMD_COMPATIBLE_VERSIONS.join(", ")}); it is kept and used as it is.`,
-            alreadyDone: true,
-            problem: "",
-        });
-    }
-    if (version !== null) {
-        // Reached only for a version that is neither checked nor newer than every checked one.
-        return action({
-            id: "install-qmd",
-            summary: `Keep the QMD ${version} in ${where}; it is not replaced.`,
+            summary: `Leave the existing QMD at ${location} untouched; it is outside this setup's reviewed install.`,
             alreadyDone: false,
-            blocker: `QMD ${version} is installed in ${where}, and this skill works only with QMD ${QMD_COMPATIBLE_VERSIONS.join(" or ")} or newer. It is kept as it is. To go ahead, upgrade it yourself to QMD ${newest} (npm install -g @tobilu/qmd@${newest}, with the same prefix it was installed with), then plan again.`,
-            problem: `QMD ${version} is not a version this setup supports.`,
-        });
-    }
-    if (foreignCommand !== undefined) {
-        return action({
-            id: "install-qmd",
-            summary: "Leave the qmd command already on your PATH alone; no second QMD is installed.",
-            alreadyDone: false,
-            blocker: `A qmd command is on your PATH (${foreignCommand}), but no QMD package could be found for it (not in ~/.local, beside it, or in npm's global folder). This setup will not install a second QMD next to it, because both would share one index. Reinstall QMD with npm (npm install -g @tobilu/qmd), or remove that command, then plan again.`,
-            problem: "QMD is not installed where this setup expects it.",
+            blocker: `An existing QMD installation was found at ${location}. This setup will not replace or adopt it because its dependency graph and HTTP service ownership are not verified. Stop its HTTP service and remove or move the foreign command before applying reviewed QMD ${QMD_VERSION}.`,
+            problem: "QMD is not installed from this setup's reviewed dependency graph.",
         });
     }
     return action({
         id: "install-qmd",
-        summary: `Install QMD ${QMD_VERSION}, a search engine for your notes that runs on this computer.`,
+        summary: setupOwnedLegacy
+            ? `Replace this setup's legacy QMD with reviewed QMD ${QMD_VERSION} and its pinned dependency graph.`
+            : `Install reviewed QMD ${QMD_VERSION} and its pinned dependency graph.`,
         downloadBytes: QMD_PACKAGE_BYTES[facts.platform],
         alreadyDone: false,
-        problem: "QMD is not installed.",
+        problem: `Reviewed QMD ${QMD_VERSION} is not installed.`,
     });
 }
 
@@ -624,9 +567,8 @@ function ollamaInstallAction(facts) {
 }
 
 /**
- * Ordered actions for `choices`. Order matters: Ollama must serve before the model
- * pull, settings exist before services start, agents connect after the servers run,
- * and the one step whose admin need can be deferred (start at boot) comes last.
+ * Ordered actions for `choices`: private storage, reviewed runtimes, settings, then
+ * agent migration. Ollama must serve before its model is pulled.
  * @param {Facts} facts
  * @param {Choices} choices
  * @returns {Action[]}
@@ -640,6 +582,12 @@ export function planActions(facts, choices) {
     const unit = facts.ollama.systemUnit;
 
     const actions = [
+        action({
+            id: "secure-storage",
+            summary: "Restrict memory databases, indexes, settings, and model cache to this user.",
+            alreadyDone: facts.privateStorage === true,
+            problem: "Memory and QMD storage permissions are not private.",
+        }),
         qmdInstallAction(facts),
         rebuildAction(facts, "qmd"),
         longMemoryInstallAction(facts),
@@ -678,10 +626,11 @@ export function planActions(facts, choices) {
             id: "write-settings",
             summary:
                 facts.qmd.foreignCommand === undefined
-                    ? "Save LongMemory's settings in your user folder, and add the qmd command to your terminal."
-                    : `Save LongMemory's settings in your user folder. Your terminal keeps its own qmd command (${facts.qmd.foreignCommand}).`,
-            alreadyDone: facts.settingsWritten && facts.longmemory.envModel === tier.longmemory.model,
-            problem: "Settings files are missing or out of date.",
+                    ? "Save private settings and the recorded native launcher paths for this user."
+                    : `Save private settings and launcher paths. The terminal keeps its existing qmd command (${facts.qmd.foreignCommand}).`,
+            alreadyDone:
+                facts.settingsWritten && facts.privateStorage === true && facts.nativeRuntime === true && facts.qmd.reviewed === true && facts.longmemory.built && facts.longmemory.envModel === tier.longmemory.model,
+            problem: "Private settings or reviewed native launch paths are missing or out of date.",
         }),
         action({
             id: "set-search-model",
@@ -691,8 +640,8 @@ export function planActions(facts, choices) {
             alreadyDone: !qmdIndexIsNew(facts),
             problem: "QMD's index has no search model set.",
         }),
-        serverAction(facts, "start-qmd", "QMD's search server", facts.qmd.healthy, facts.services.qmd, startWhen),
-        longMemoryServerAction(facts, startWhen),
+        qmdServerAction(facts),
+        longMemoryServerAction(facts),
         ...choices.agents.map((id) =>
             action({
                 id: `connect-${id}`,
@@ -721,11 +670,11 @@ export function planActions(facts, choices) {
             }),
         );
     }
-    if (facts.platform === "linux" && choices.bootMode === "boot") {
+    if (facts.platform === "linux" && choices.bootMode === "boot" && owner.owner === "skill") {
         actions.push(
             action({
                 id: "enable-boot-start",
-                summary: "Let the search and memory servers start when the computer starts, before anyone logs in. This may ask for the admin password once.",
+                summary: "Let Ollama's user service start at boot before anyone logs in. This may ask for the admin password once.",
                 needsAdmin: !facts.lingerEnabled && !facts.sudoNonInteractive && facts.selfLingerAllowed !== true,
                 adminCommand: `sudo loginctl enable-linger ${facts.username}`,
                 alreadyDone: facts.lingerEnabled,
@@ -853,8 +802,10 @@ export function startSummary(facts, choices) {
     const outside = "not managed by this setup (it was already running)";
     const owner = predictedOllamaOwner(facts);
     return {
-        qmd: facts.qmd.healthy && !facts.services.qmd ? outside : userServices,
-        longmemory: facts.longmemory.healthy && !facts.services.longmemory ? outside : userServices,
+        qmd: qmdServerReady(facts) ? "on demand when an agent connects over stdio" : "not ready for native stdio connections",
+        longmemory: !longMemoryRestartPending(facts)
+            ? "on demand when an agent connects over stdio"
+            : "not ready for native stdio connections",
         ollama: ollamaForeign(facts)
             ? outside
             : owner.owner === "system-unit"

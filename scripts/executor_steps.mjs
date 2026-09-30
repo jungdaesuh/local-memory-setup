@@ -40,10 +40,10 @@ export function ollamaStartStep(state) {
  * built for (better-sqlite3 exports node_register_module_v<ABI>; QMD and LongMemory
  * both depend on it). node-llama-cpp uses Node-API and does not depend on the ABI.
  * @param {"qmd" | "longmemory"} component
- * @param {{ qmdPackage: string, sourceDir: string }} L
+ * @param {{ qmdPackage: string, qmdRoot?: string, sourceDir: string }} L
  */
 export function nativeModuleFile(component, L) {
-    const root = component === "qmd" ? L.qmdPackage : L.sourceDir;
+    const root = component === "qmd" ? L.qmdRoot ?? L.qmdPackage : L.sourceDir;
     return path.join(root, "node_modules", "better-sqlite3", "build", "Release", "better_sqlite3.node");
 }
 
@@ -60,14 +60,14 @@ export function nativeModuleAbi(binary) {
 
 /**
  * The command that rebuilds a component's native modules for `nodeBin`. The Node's own
- * directory goes first on PATH, so npm, pnpm, node-gyp and prebuild-install all build or
+ * directory goes first on PATH, so npm, node-gyp and prebuild-install all build or
  * fetch binaries for that Node.
  * @param {"qmd" | "longmemory"} component
- * @param {{ L: { qmdPackage: string, sourceDir: string }, nodeBin: string, npm: string, pnpmEntry: string, pathEnv: string, delimiter: string }} spec
+ * @param {{ L: { qmdPackage: string, qmdRoot?: string, sourceDir: string }, nodeBin: string, npm: string, pathEnv: string, delimiter: string }} spec
  * @returns {{ command: string, args: string[], cwd: string, pathEnv: string }}
  */
 export function rebuildCommand(component, spec) {
     const pathEnv = `${path.dirname(spec.nodeBin)}${spec.delimiter}${spec.pathEnv}`;
-    if (component === "qmd") return { command: spec.npm, args: ["rebuild"], cwd: spec.L.qmdPackage, pathEnv };
-    return { command: spec.nodeBin, args: [spec.pnpmEntry, "rebuild"], cwd: spec.L.sourceDir, pathEnv };
+    if (component === "qmd") return { command: spec.npm, args: ["rebuild"], cwd: spec.L.qmdRoot ?? spec.L.qmdPackage, pathEnv };
+    return { command: spec.npm, args: ["rebuild"], cwd: spec.L.sourceDir, pathEnv };
 }

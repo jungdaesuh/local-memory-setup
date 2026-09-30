@@ -27,9 +27,11 @@ import {
     withInstructionsBlock,
     withOpencodeInstruction,
 } from "./agent_instructions.mjs";
-import { detectAgents, detectInstructions } from "./detect.mjs";
+import { detectAgents, detectInstructions, opencodeMcpConfigFile } from "./detect.mjs";
 import { applyAgentInstructions } from "./instructions_apply.mjs";
 import { layout } from "./layout.mjs";
+import { memoryClientSpecs } from "./mcp_runtime.mjs";
+import { upsertStdioJson } from "./stdio_config.mjs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { parseJsonc, tomlStructureProblems } from "./mcp_config.mjs";
 
@@ -96,12 +98,15 @@ test("the project_id rule states LongMemory's own current_project normalization"
     assert.equal(stated[2], replacement);
 });
 
-const LONGMEMORY_UPSTREAM = process.env.LONGMEMORY_CHECKOUT ?? "/home/jungdaesuh/code/opensource/OpenMemory";
+// A LongMemory git checkout to compare against, from LONGMEMORY_CHECKOUT; the test skips without one.
+const LONGMEMORY_UPSTREAM = process.env.LONGMEMORY_CHECKOUT ?? "";
 const hasUpstreamRuntime =
-    fs.existsSync(LONGMEMORY_UPSTREAM) && spawnSync("git", ["-C", LONGMEMORY_UPSTREAM, "cat-file", "-e", "origin/main:src/mcp/runtime.ts"], { stdio: "ignore" }).status === 0;
+    LONGMEMORY_UPSTREAM !== "" &&
+    fs.existsSync(LONGMEMORY_UPSTREAM) &&
+    spawnSync("git", ["-C", LONGMEMORY_UPSTREAM, "cat-file", "-e", "origin/main:src/mcp/runtime.ts"], { stdio: "ignore" }).status === 0;
 test(
     "the vendored current_project line is origin/main's runtime.ts line, read with git show",
-    { skip: !hasUpstreamRuntime && `no origin/main runtime.ts at ${LONGMEMORY_UPSTREAM} (set LONGMEMORY_CHECKOUT)` },
+    { skip: !hasUpstreamRuntime && (LONGMEMORY_UPSTREAM === "" ? "set LONGMEMORY_CHECKOUT to a LongMemory checkout" : `no origin/main runtime.ts at ${LONGMEMORY_UPSTREAM}`) },
     () => {
         const source = execFileSync("git", ["-C", LONGMEMORY_UPSTREAM, "show", "origin/main:src/mcp/runtime.ts"], { encoding: "utf8" });
         assert.equal(source.split("\n")[RUNTIME_TS_LINE - 1], CURRENT_PROJECT_SOURCE);
@@ -245,17 +250,63 @@ test("layout honours each agent's directory variable, and OpenCode's MCP directo
     assert.equal(plain.claudeRulesSeenByGrok, true);
 });
 
-test("OpenCode servers in the global directory count as wired when OPENCODE_CONFIG_DIR is set, so a user's entry is never re-added", () => {
+test("OpenCode HTTP servers in any config are foreign and never count as stdio-ready", () => {
     const { L } = fakeTree();
     fs.mkdirSync(L.opencodeMcpDir, { recursive: true });
     // The user's own qmd (another port) and a longmemory entry, where `opencode mcp add` writes.
     fs.writeFileSync(path.join(L.opencodeMcpDir, "opencode.json"), JSON.stringify({ mcp: { qmd: { type: "remote", url: "http://localhost:9999/mcp" } } }));
+    fs.writeFileSync(path.join(L.opencodeMcpDir, "opencode.jsonc"), '{ "theme": "x" }');
     fs.mkdirSync(L.opencodeInstructionsDir, { recursive: true });
     fs.writeFileSync(path.join(L.opencodeInstructionsDir, "opencode.jsonc"), '{ "mcp": { "longmemory": { "type": "remote", "url": "u" } } }');
     assert.deepEqual(opencodeMcpNames(L).sort(), ["longmemory", "qmd"]);
-    const opencode = detectAgents(L, () => new Set(["opencode"])).agents.opencode;
-    assert.equal(opencode.qmd, true);
-    assert.equal(opencode.longmemory, true);
+    assert.equal(opencodeMcpConfigFile(L), path.join(L.opencodeMcpDir, "opencode.json"));
+    const detected = detectAgents(L, process.execPath, () => new Set(["opencode"]));
+    assert.equal(detected.agents.opencode.qmd, false);
+    assert.equal(detected.agents.opencode.longmemory, false);
+    assert.match(detected.problems.opencode ?? "", /foreign MCP configuration/);
+});
+
+test("OpenCode migrates an exact legacy server in opencode.json when JSONC holds unrelated settings", () => {
+    const { L } = fakeTree();
+    fs.mkdirSync(L.opencodeMcpDir, { recursive: true });
+    const json = path.join(L.opencodeMcpDir, "opencode.json");
+    const jsonc = path.join(L.opencodeMcpDir, "opencode.jsonc");
+    const original = '{"mcp":{"qmd":{"type":"remote","url":"http://localhost:8181/mcp"}}}\n';
+    const unrelated = '{\n  // local preference\n  "model": "x",\n}\n';
+    fs.writeFileSync(json, original);
+    fs.writeFileSync(jsonc, unrelated);
+
+    assert.equal(opencodeMcpConfigFile(L), json);
+    const detected = detectAgents(L, process.execPath, () => new Set(["opencode"]));
+    assert.equal(detected.agents.opencode.qmd, false);
+    assert.equal(detected.problems.opencode, undefined);
+
+    const migration = upsertStdioJson(original, "opencode", memoryClientSpecs(L, process.execPath));
+    assert.equal(migration.ready, true);
+    assert.equal(migration.changed, true);
+    assert.equal(fs.readFileSync(jsonc, "utf8"), unrelated);
+});
+
+test("OpenCode blocks duplicated memory definitions across opencode.json and opencode.jsonc", () => {
+    const { L } = fakeTree();
+    fs.mkdirSync(L.opencodeMcpDir, { recursive: true });
+    fs.writeFileSync(path.join(L.opencodeMcpDir, "opencode.json"), '{"mcp":{"qmd":{"type":"remote","url":"http://localhost:8181/mcp"}}}');
+    fs.writeFileSync(path.join(L.opencodeMcpDir, "opencode.jsonc"), '{"mcp":{"qmd":{"type":"remote","url":"http://localhost:8181/mcp"}}}');
+
+    const detected = detectAgents(L, process.execPath, () => new Set(["opencode"]));
+    assert.equal(detected.agents.opencode.qmd, false);
+    assert.match(detected.problems.opencode ?? "", /same server is defined more than once/);
+});
+
+test("OpenCode chooses an existing memory config, then JSON before JSONC when neither defines memory", () => {
+    const { L } = fakeTree();
+    fs.mkdirSync(L.opencodeMcpDir, { recursive: true });
+    const json = path.join(L.opencodeMcpDir, "opencode.json");
+    const jsonc = path.join(L.opencodeMcpDir, "opencode.jsonc");
+    fs.writeFileSync(jsonc, '{"model":"x"}');
+    assert.equal(opencodeMcpConfigFile(L), jsonc);
+    fs.writeFileSync(json, '{"theme":"dark"}');
+    assert.equal(opencodeMcpConfigFile(L), json);
 });
 
 test("within one OpenCode folder the last file defining instructions wins, and the setup writes there", () => {
@@ -417,14 +468,14 @@ test("a malformed agent config becomes a problem naming the file, and only insta
     fs.mkdirSync(path.dirname(L.claudeJson), { recursive: true });
     fs.writeFileSync(L.claudeJson, "{ not json");
     // Neither agent relevant: nothing is parsed, nothing is reported.
-    const none = detectAgents(L, () => new Set());
+    const none = detectAgents(L, process.execPath, () => new Set());
     assert.deepEqual(none.problems, {});
     /** @type {Partial<Record<import("./plan.mjs").AgentId, string>>} */
     const quiet = {};
     detectInstructions(L, {}, new Set(), quiet);
     assert.deepEqual(quiet, {});
     // Both relevant: each problem names its own file.
-    const both = detectAgents(L, () => new Set(["claude", "opencode"]));
+    const both = detectAgents(L, process.execPath, () => new Set(["claude", "opencode"]));
     assert.match(both.problems.claude ?? "", new RegExp(`^${L.claudeJson.replaceAll("/", "\\/")} could not be read .*fix or remove it, then plan again\\.$`));
     assert.match(both.problems.opencode ?? "", /could not be read/);
     assert.equal(both.agents.opencode.qmd, false);

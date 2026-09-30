@@ -1,0 +1,3 @@
+- [Lock only the root graph needed by a frozen source build](2026-09-30-root-only-npm-lock.md) — preserve audited root versions and bind build reuse to source/output plus npm graph metadata without claiming full node_modules byte authenticity.
+- [Treat transport readiness and server health as separate facts](2026-09-30-native-stdio-security-gates.md) — verify exact stdio config, preserve shared project scope with real write/recall, and retire legacy listeners.
+- [Verify effective access and registered ownership](2026-09-30-windows-effective-private-access.md) — accept effective owner-only inherited file access and retire tasks from their registered XML.

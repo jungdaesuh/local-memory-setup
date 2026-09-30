@@ -15,7 +15,8 @@ The script prints one JSON document on stdout; progress goes to stderr.
 
 ## At session start: silent check
 
-Run `SCRIPT --check`. It changes nothing, never calls sudo, and does not use the network. It reports whether the running LongMemory build is healthy.
+Run `SCRIPT --check`. It changes nothing, never calls sudo or contacts external services,
+and checks local runtime, storage, agent configuration and service state.
 
 - Exit 0 and no output: everything is healthy. Say nothing about this skill.
 - Exit 3 with `"installed": false`: local memory has never been set up here. Start the
@@ -26,9 +27,15 @@ Run `SCRIPT --check`. It changes nothing, never calls sudo, and does not use the
   choices (agents that are no longer installed are left out).
 - Any other exit: show `detail` and stop.
 
+The security migration is prepared in this source tree but has not yet been applied to
+an installed setup. A read-only check does not stop legacy QMD or LongMemory HTTP
+listeners. If one is still installed, tell the user it remains exposed until a reviewed
+`--apply` completes; get their agreement before applying.
+
 ## First-time flow: plan, explain, ask once
 
-1. Run `SCRIPT --plan`. It changes nothing and prints the plan.
+1. Run `SCRIPT --plan`. It changes nothing and uses local probes only; it does not query
+   Git, npm or a mutable upstream `main` branch.
 2. Explain it in plain, non-technical words. Cover:
    - what gets installed: a search engine for their notes (QMD), a memory server that lets
      their AI agents remember things between sessions (LongMemory), and Ollama, which runs
@@ -40,12 +47,21 @@ Run `SCRIPT --check`. It changes nothing, never calls sudo, and does not use the
      downloaded when the note says so);
    - whether an admin password is needed: `totals.needsAdmin`, and for which step
      (the action with `needsAdmin: true`);
-   - what starts again after a restart: on Linux with `bootMode` "boot", when the computer
-     starts; otherwise when they log in. Ollama's own timing is in `detected.ollama.owner`
-     (`system-unit` starts at boot);
-   - that everything stays on this computer: the servers listen only on this machine.
-     `--plan` looks up LongMemory's current `main` commit and shows `LongMemory main @ <short sha>`,
-     including whether that differs from the running build. The install downloads the programs and models;
+   - when things start: QMD and LongMemory start on demand when an agent connects over
+     stdio. Ollama's timing is in `detected.ollama.owner` (`system-unit` starts at boot;
+     otherwise the setup may start it when they log in);
+   - how connections work: each agent starts QMD or LongMemory as its own native stdio
+     MCP child process through the managed launcher. The agent entry names the pinned
+     Node executable, launcher, server (`qmd` or `longmemory`) and private runtime file;
+     the servers do not share memory HTTP listeners. LongMemory keeps the shared default
+     tenant/user scope across working directories. Its launcher waits until Ollama reports
+     the selected model at `127.0.0.1:11434` before starting it. Setup downloads reviewed
+     programs and models;
+   - which reviewed releases will be used: QMD 2.8.3 and LongMemory commit
+     `9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5`. The npm manifests and lockfiles are
+     committed under `dependencies/`; installs use `npm ci`. LongMemory uses a reviewed
+     root-only npm graph for its source build and does not bootstrap pnpm or follow
+     mutable `main`;
    - that each connected agent gets short global instructions telling it when to recall
      and what to store (the `instructions-<agent>` actions).
 3. Explain the model size. One size sets both the note-search model (QMD) and the
@@ -83,12 +99,32 @@ Run `SCRIPT --check`. It changes nothing, never calls sudo, and does not use the
      `SCRIPT --apply --choices <that file>`.
    - **Not now**: do nothing, and do not ask again in this session.
 
-Never run `--apply` or `--update` unless the user agreed in this chat. `--update` resolves LongMemory's current `main` and runs only the LongMemory steps: build that commit into its own directory, smoke-test it, switch the `current` build, then restart the service. A failed smoke test or restart leaves the previous build running.
+Never run `--apply` or `--update` unless the user agreed in this chat. `--apply` migrates
+only recognized legacy HTTP client entries, backs up changed agent configuration and
+setup-owned service files under `~/.config/local-memory-setup/backups/`, and retires
+setup-owned legacy QMD/LongMemory HTTP services. Custom/foreign definitions and foreign
+service registrations are preserved and block migration; show the blockers and do not
+work around them. It never deletes the memory database.
+
+Run `--update` only after a successful `--apply` has completed initial setup or repaired
+agent configurations. Before writing, it blocks if private storage or the native
+launcher is unavailable, or the setup-owned legacy LongMemory service remains. Once
+ready, it builds and switches only the reviewed LongMemory source commit and npm lockfile;
+it does not follow upstream `main`, update arbitrary packages or change agent
+configurations or service registrations. A candidate is built and smoke-tested before
+switching. The prior build is retained as the previous build for rollback until a later
+update.
+
+On successful `--update`, the result names the installed `commit`. Report that reviewed
+LongMemory build only; do not say the full setup or agent-configuration migration was
+applied unless a separate `--apply` reports success.
 
 ## Reading the apply result
 
 - `"status": "ready"`: tell the user it is done in two or three sentences: the model size
   they got, that their agents are connected, and when things start again (`startsAgain`).
+  QMD and LongMemory start on demand when an agent connects over stdio; only Ollama is a
+  managed background service.
 - `"status": "needs_admin"`: show `detail` and each line of `commands`. Ask the user to run
   them in a terminal, then run the same apply command again. When only start-at-boot needs
   it, `detail` says everything else is already set up and running; say so.
@@ -100,8 +136,9 @@ Never run `--apply` or `--update` unless the user agreed in this chat. `--update
 Apply is safe to run again: steps already done are skipped. The choices are saved once
 everything works, including when only the start-at-boot admin step is still waiting.
 The setup never downloads QMD's search models itself; QMD fetches each one the first
-time it needs it. The plan's `totals.blockers` lists conflicts before you ask the
-user anything; mention them in the explanation.
+time it needs it. Retrieval stays on CPU; `qmd embed` uses Metal on Apple Silicon or
+Vulkan elsewhere according to the managed environment. The plan's `totals.blockers`
+lists conflicts before you ask the user anything; mention them in the explanation.
 
 ## Choices file
 
@@ -124,11 +161,11 @@ the model size sets QMD's model only for a new index.
 
 ## Leave alone
 
-Do not install the npm package named `longmemory`: that is the old server. This skill builds
-LongMemory from the current `main` of https://github.com/CaviraOSS/LongMemory. Each commit
-gets its own directory; the memory database stays outside those directories. The running
-build is switched only after the new one passes its smoke test, and older builds are removed
-only after that switch (the current and previous builds are kept). Leave an existing
-OpenMemory server on port 8080 alone. The script itself leaves alone any QMD, LongMemory,
-or Ollama that is already running and was started by something else, and never replaces
-or downgrades an installed QMD.
+Do not install the npm package named `longmemory` from a registry. This skill builds the
+reviewed LongMemory commit `9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5` with its committed
+root-only `package-lock.json`; it does not track upstream `main` or use pnpm. Each reviewed
+build has a source-and-dependency identity and its own directory; the memory database
+stays outside those directories. A candidate is switched only after its build and stdio
+smoke test pass. The current and previous builds are retained for rollback. Leave an
+existing OpenMemory server alone. Foreign QMD installations, configurations and services
+are never silently replaced or stopped; the plan blocks when they conflict with migration.

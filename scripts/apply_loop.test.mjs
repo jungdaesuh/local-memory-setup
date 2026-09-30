@@ -3,6 +3,7 @@ import test from "node:test";
 import { NeedsAdmin, StepFailed, runApply } from "./apply_loop.mjs";
 import { run } from "./proc.mjs";
 import { planActions } from "./plan.mjs";
+import { LONGMEMORY_COMMIT } from "./layout.mjs";
 
 const GIB = 1024 * 1024 * 1024;
 
@@ -21,8 +22,10 @@ function facts() {
         brewAvailable: false,
         agents: { claude: { installed: true, qmd: false, longmemory: false }, codex: off, grok: off, opencode: off },
         qmd: {
-            version: "2.5.3",
-            healthy: true,
+            version: "2.8.3",
+            healthy: false,
+            reviewed: true,
+            reviewedOwned: true,
             cachedModels: [
                 "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf",
                 "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf",
@@ -31,10 +34,12 @@ function facts() {
             collectionPaths: [],
             configModels: { embed: "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf" },
         },
-        longmemory: { built: true, healthy: true, envFile: true, envModel: "bge-m3", dbExists: true },
-        ollama: { installed: true, healthy: true, models: ["bge-m3:latest"], systemUnit: { loaded: true, enabled: true, active: true }, ollamaApp: false, brewService: false },
-        services: { qmd: true, longmemory: true, ollama: false },
+        longmemory: { built: true, healthy: false, main: LONGMEMORY_COMMIT, current: LONGMEMORY_COMMIT, envFile: true, envModel: "bge-m3", dbExists: true },
+        ollama: { installed: true, healthy: true, models: ["bge-m3:latest"], systemUnit: { loaded: false, enabled: false, active: false }, ollamaApp: false, brewService: false },
+        services: { qmd: false, longmemory: false, ollama: true },
         settingsWritten: true,
+        privateStorage: true,
+        nativeRuntime: true,
         saved: null,
         notesDir: null,
     });

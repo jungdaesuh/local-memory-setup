@@ -42,10 +42,12 @@ export function qmdPathPrepend(node) {
  * @returns {readonly EnvSetting[]}
  */
 export function qmdEnvironment(hardware, mode) {
+    /** @type {readonly EnvSetting[]} */
+    const network = [["QMD_HOST", null], ["QMD_ALLOWED_ORIGINS", null], ["QMD_ALLOWED_HOSTS", null]];
     if (mode === "embed" && hardware.gpu !== "none") {
-        return [["QMD_FORCE_CPU", null], ["QMD_LLAMA_GPU", hardware.gpu === "apple" ? "metal" : "vulkan"]];
+        return [...network, ["QMD_FORCE_CPU", null], ["QMD_LLAMA_GPU", hardware.gpu === "apple" ? "metal" : "vulkan"]];
     }
-    return [["QMD_FORCE_CPU", "1"], ["QMD_LLAMA_GPU", null]];
+    return [...network, ["QMD_FORCE_CPU", "1"], ["QMD_LLAMA_GPU", null]];
 }
 
 /**
