@@ -1,13 +1,13 @@
 /**
- * Local memory setup: QMD (search) and CaviraOSS LongMemory (memory, built from the
- * reviewed commit of LONGMEMORY_REPO; the npm package "longmemory" is the old HSG server),
+ * Local memory setup: QMD (search) and CaviraOSS LongMemory (memory, built from the latest
+ * main of LONGMEMORY_REPO; the npm package "longmemory" is the old HSG server),
  * with Ollama for LongMemory's embeddings, native stdio MCP wiring and private storage.
  *
  *   node ensure.mjs [--check]              health check, no changes, no network (default)
- *   node ensure.mjs --plan                 detect and print the plan; no changes
+ *   node ensure.mjs --plan                 detect (incl. LongMemory main via git ls-remote) and print the plan; no changes
  *   node ensure.mjs --apply --choices F    run the plan's pending actions for choices file F
  *   node ensure.mjs --apply --yes          same, with the plan's recommended choices
- *   node ensure.mjs --update               install the reviewed LongMemory build
+ *   node ensure.mjs --update               build and switch to LongMemory main when it is not the running build
  *
  * stdout carries exactly one JSON document (none for a healthy --check).
  * Exit codes: 0 done or healthy, 1 failed or blocked, 2 needs an admin step, 3 unhealthy, 64 usage.
@@ -39,7 +39,6 @@ import {
     OLLAMA_TAGS_URL,
     OLLAMA_VERSION,
     QMD_VERSION,
-    LONGMEMORY_COMMIT,
     SERVICE_NAMES,
     assertSha256Match,
     fileSha256,
@@ -209,7 +208,9 @@ const EXECUTORS = {
     "rebuild-longmemory": async (ctx) => rebuildNative("longmemory", ctx),
 
     "install-longmemory": async ({ node, facts }) => {
-        const sha = LONGMEMORY_COMMIT;
+        // Apply detects with resolveMain, so this is the main the plan just compared.
+        const sha = facts.longmemory.main;
+        if (sha === undefined) throw new Error("LongMemory main was not resolved before its build.");
         await installLongMemoryCommit({
             sha,
             node,
@@ -455,7 +456,7 @@ function connectAgent(agent, node) {
 /**
  * @param {boolean} yes
  * @param {string | undefined} choicesFile
- * @param {boolean} updateOnly install the reviewed LongMemory build; do not save choices
+ * @param {boolean} updateOnly build and switch to LongMemory main only; do not save choices
  */
 async function apply(yes, choicesFile, updateOnly) {
     const facts = await detectFacts(L, { probeAdmin: true, resolveMain: true });

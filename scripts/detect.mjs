@@ -17,8 +17,8 @@ import { codexInstructionsTarget, instructionsBlockCurrent, instructionsText } f
 import { nativeModuleAbi, nativeModuleFile } from "./executor_steps.mjs";
 import { readIfExists } from "./fs_util.mjs";
 import { longMemoryHealthy, ollamaModelNames, qmdHealthy } from "./health.mjs";
-import { LONGMEMORY_COMMIT, LONGMEMORY_HEALTH_URL, MARKER, OLLAMA_TAGS_URL, QMD_HEALTH_URL, QMD_VERSION, SERVICE_NAMES, SQLITE_URI_NODE } from "./layout.mjs";
-import { runningLongMemory } from "./longmemory_build.mjs";
+import { LONGMEMORY_HEALTH_URL, LONGMEMORY_REPO, MARKER, OLLAMA_TAGS_URL, QMD_HEALTH_URL, QMD_VERSION, SERVICE_NAMES, SQLITE_URI_NODE } from "./layout.mjs";
+import { resolveLongMemoryMain, runningLongMemory } from "./longmemory_build.mjs";
 import { parseEnvFile } from "./longmemory_env.mjs";
 import { memoryClientSpecs, memoryRuntimeCurrent } from "./mcp_runtime.mjs";
 import { reviewedDependencyFingerprint } from "./dependency_install.mjs";
@@ -503,7 +503,7 @@ function qmdReviewedCurrent(packageDir, L, stampText, packageJsonText) {
 
 /**
  * @param {Layout} L
- * `resolveMain` remains accepted for older callers; source identity is pinned in layout.mjs.
+ * `resolveMain` asks LONGMEMORY_REPO for refs/heads/main (git ls-remote, network); the offline --check leaves it false.
  * @param {{ probeAdmin: boolean, resolveMain: boolean }} options
  * @returns {Promise<Facts>}
  */
@@ -540,7 +540,7 @@ export async function detectFacts(L, options) {
     const cacheFiles = modelUris.map((uri) => /** @type {const} */ ([uri, qmdModelCacheFile(uri)]));
     const qmdInstallStamp = readIfExists(L.qmdInstallStamp);
     const running = runningLongMemory(L, process.platform);
-    const main = LONGMEMORY_COMMIT;
+    const main = options.resolveMain ? resolveLongMemoryMain(LONGMEMORY_REPO) : undefined;
     const privateStorage = memoryStoragePrivate(L, platform);
     const nativeRuntime = nodeUsable && memoryRuntimeCurrent(L, node);
     const reviewedQmd = qmdReviewedCurrent(qmdPackageDir, L, qmdInstallStamp, qmdPackageJson);
@@ -601,7 +601,7 @@ export async function detectFacts(L, options) {
         longmemory: {
             built: running !== null,
             ...(running === null ? {} : { current: running.commit }),
-            main,
+            ...(main === undefined ? {} : { main }),
             healthy: longMemoryHealthy(longMemoryBody),
             envFile: envText !== null,
             ...(env.LONGMEMORY_OLLAMA_EMBEDDING_MODEL === undefined ? {} : { envModel: env.LONGMEMORY_OLLAMA_EMBEDDING_MODEL }),

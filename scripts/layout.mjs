@@ -1,7 +1,8 @@
 /**
  * Where everything lives and which versions are installed. Single source for
  * paths, ports, URLs, and pinned upstream versions; detection and apply both read it.
- * LongMemory source and both dependency graphs are frozen for review.
+ * QMD and its dependency graph are pinned; LongMemory follows the latest main of
+ * LONGMEMORY_REPO (see longmemory_build.mjs).
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -18,6 +19,11 @@ export const QMD_VERSION = "2.8.3";
  * listen on QMD_HOST ?? "localhost", cli ensureModelsConfiguredForCli).
  */
 export const QMD_COMPATIBLE_VERSIONS = ["2.8.3"];
+/**
+ * Reviewed baseline: the LongMemory commit dependencies/longmemory was derived and audited
+ * for. When main is this commit, that committed lockfile is installed; a newer main is
+ * not refused, it gets a freshly generated lockfile behind the audit gate.
+ */
 export const LONGMEMORY_COMMIT = "9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5";
 export const LONGMEMORY_REPO = "https://github.com/CaviraOSS/LongMemory.git";
 /**

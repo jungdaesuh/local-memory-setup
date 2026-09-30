@@ -34,8 +34,9 @@ listeners. If one is still installed, tell the user it remains exposed until a r
 
 ## First-time flow: plan, explain, ask once
 
-1. Run `SCRIPT --plan`. It changes nothing and uses local probes only; it does not query
-   Git, npm or a mutable upstream `main` branch.
+1. Run `SCRIPT --plan`. It changes nothing. Besides local probes it asks GitHub for
+   LongMemory's latest `main` commit (`git ls-remote`); the install action says
+   "LongMemory main @ <commit>" and names the running build.
 2. Explain it in plain, non-technical words. Cover:
    - what gets installed: a search engine for their notes (QMD), a memory server that lets
      their AI agents remember things between sessions (LongMemory), and Ollama, which runs
@@ -55,13 +56,12 @@ listeners. If one is still installed, tell the user it remains exposed until a r
      Node executable, launcher, server (`qmd` or `longmemory`) and private runtime file;
      the servers do not share memory HTTP listeners. LongMemory keeps the shared default
      tenant/user scope across working directories. Its launcher waits until Ollama reports
-     the selected model at `127.0.0.1:11434` before starting it. Setup downloads reviewed
+     the selected model at `127.0.0.1:11434` before starting it. Setup downloads the
      programs and models;
-   - which reviewed releases will be used: QMD 2.8.3 and LongMemory commit
-     `9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5`. The npm manifests and lockfiles are
-     committed under `dependencies/`; installs use `npm ci`. LongMemory uses a reviewed
-     root-only npm graph for its source build and does not bootstrap pnpm or follow
-     mutable `main`;
+   - which versions will be used: QMD 2.8.3, and LongMemory's latest `main` (the commit in
+     the install action). When that commit is the reviewed baseline, its committed npm
+     lockfile is used; otherwise a fresh lockfile is generated and must pass `npm audit`
+     with no high or critical production advisories before anything is installed;
    - that each connected agent gets short global instructions telling it when to recall
      and what to store (the `instructions-<agent>` actions).
 3. Explain the model size. One size sets both the note-search model (QMD) and the
@@ -109,15 +109,17 @@ work around them. It never deletes the memory database.
 Run `--update` only after a successful `--apply` has completed initial setup or repaired
 agent configurations. Before writing, it blocks if private storage or the native
 launcher is unavailable, or the setup-owned legacy LongMemory service remains. Once
-ready, it builds and switches only the reviewed LongMemory source commit and npm lockfile;
-it does not follow upstream `main`, update arbitrary packages or change agent
-configurations or service registrations. A candidate is built and smoke-tested before
-switching. The prior build is retained as the previous build for rollback until a later
-update.
+ready, it builds and switches LongMemory to the latest `main` when that is not the running
+build; it does not update other packages or change agent configurations or service
+registrations. A candidate is built and smoke-tested before switching. The prior build is
+retained as the previous build for rollback until a later update; memories are kept.
 
-On successful `--update`, the result names the installed `commit`. Report that reviewed
-LongMemory build only; do not say the full setup or agent-configuration migration was
-applied unless a separate `--apply` reports success.
+On successful `--update`, the result names the installed `commit`. Report that LongMemory
+build only; do not say the full setup or agent-configuration migration was applied unless
+a separate `--apply` reports success. If `--update` or `--apply` fails at
+`install-longmemory` because `npm audit` found high or critical advisories, say that the
+newest LongMemory was not installed for that reason, name the advisories from `detail`,
+and that the running build and memories are unchanged; a later update retries.
 
 ## Reading the apply result
 
@@ -161,10 +163,10 @@ the model size sets QMD's model only for a new index.
 
 ## Leave alone
 
-Do not install the npm package named `longmemory` from a registry. This skill builds the
-reviewed LongMemory commit `9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5` with its committed
-root-only `package-lock.json`; it does not track upstream `main` or use pnpm. Each reviewed
-build has a source-and-dependency identity and its own directory; the memory database
+Do not install the npm package named `longmemory` from a registry. This skill builds
+LongMemory's latest `main` from source with a root-only npm lockfile (the committed one for
+the reviewed baseline commit, otherwise a generated and audited one); it does not use pnpm.
+Each build has a source-and-dependency identity and its own directory; the memory database
 stays outside those directories. A candidate is switched only after its build and stdio
 smoke test pass. The current and previous builds are retained for rollback. Leave an
 existing OpenMemory server alone. Foreign QMD installations, configurations and services

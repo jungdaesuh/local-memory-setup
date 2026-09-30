@@ -5,8 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { buildArtifactFingerprint } from "./build_integrity.mjs";
-import { LONGMEMORY_COMMIT, layout, longMemoryCli, longMemoryStamp, longMemoryStdio } from "./layout.mjs";
-import { reviewedDependencyFingerprint } from "./dependency_install.mjs";
+import { LONGMEMORY_COMMIT, fileSha256, layout, longMemoryCli, longMemoryStamp, longMemoryStdio } from "./layout.mjs";
+import { dependencyFingerprint, reviewedDependencyFingerprint, reviewedDependencyPaths } from "./dependency_install.mjs";
 import {
     buildDirectoryName,
     buildCandidateDir,
@@ -20,11 +20,14 @@ import {
     finishSwitch,
     gitAddRemoteArgs,
     gitInitArgs,
+    installLongMemoryCommit,
+    parseLsRemoteMain,
     pointCurrentAt,
     pruneBuilds,
     rollbackSwitch,
     runningLongMemory,
     smokeInvocation,
+    stagingCheckoutDir,
     switchCurrentBuild,
 } from "./longmemory_build.mjs";
 
@@ -58,8 +61,13 @@ function withTemp(prefix, operation) {
     }
 }
 
-/** @param {string} buildDir @param {string} sha @param {string} fingerprint */
-function finishBuild(buildDir, sha, fingerprint) {
+const PASSED_AUDIT = { info: 0, low: 1, moderate: 2, high: 0, critical: 0 };
+
+/**
+ * A completed build with a receipt for a generated (audited) dependency graph.
+ * @param {string} buildDir @param {string} sha @param {string} fingerprint @param {Record<string, unknown>} [graphOverrides]
+ */
+function finishBuild(buildDir, sha, fingerprint, graphOverrides = {}) {
     fs.mkdirSync(path.dirname(longMemoryCli(buildDir)), { recursive: true });
     fs.mkdirSync(path.join(buildDir, "src"), { recursive: true });
     fs.mkdirSync(path.join(buildDir, "node_modules"), { recursive: true });
@@ -70,11 +78,23 @@ function finishBuild(buildDir, sha, fingerprint) {
     fs.writeFileSync(longMemoryCli(buildDir), "cli");
     fs.copyFileSync(STDIO_BOOTSTRAP, longMemoryStdio(buildDir));
     fs.writeFileSync(path.join(buildDir, "node_modules", ".package-lock.json"), '{"lockfileVersion":3,"packages":{}}\n');
-    const artifactFingerprint = buildArtifactFingerprint(buildDir);
-    fs.writeFileSync(longMemoryStamp(buildDir), `${JSON.stringify({ commit: sha, dependencyFingerprint: fingerprint, artifactFingerprint })}\n`);
+    stampBuild(buildDir, sha, fingerprint, graphOverrides);
 }
 
-test("build identity pins the exact source and reviewed dependency bytes", () => {
+/**
+ * Write the receipt for the build's current files.
+ * @param {string} buildDir @param {string} sha @param {string} fingerprint @param {Record<string, unknown>} [graphOverrides]
+ */
+function stampBuild(buildDir, sha, fingerprint, graphOverrides = {}) {
+    const artifactFingerprint = buildArtifactFingerprint(buildDir);
+    const dependencyGraph = { source: "generated", packageLockSha256: fileSha256(path.join(buildDir, "package-lock.json")), audit: PASSED_AUDIT, ...graphOverrides };
+    fs.writeFileSync(longMemoryStamp(buildDir), `${JSON.stringify({ commit: sha, dependencyFingerprint: fingerprint, artifactFingerprint, dependencyGraph })}\n`);
+}
+
+/** The fingerprint finishBuild's manifest and lockfile bytes produce. */
+const FIXTURE_FINGERPRINT = dependencyFingerprint("longmemory", Buffer.from('{"name":"longmemory"}\n'), Buffer.from('{"lockfileVersion":3}\n'));
+
+test("build identity names the exact source commit and dependency bytes", () => {
     assert.equal(LONGMEMORY_COMMIT, "9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5");
     assert.equal(buildDirectoryName(SHA_A, DEP_A), `${SHA_A}-${DEP_A.slice(0, 16)}`);
     assert.equal(buildDirectoryName(SHA_A, DEP_A, 1), `${SHA_A}-${DEP_A.slice(0, 16)}-r1`);
@@ -84,7 +104,7 @@ test("build identity pins the exact source and reviewed dependency bytes", () =>
     assert.match(reviewedDependencyFingerprint("longmemory"), /^[0-9a-f]{64}$/);
 });
 
-test("git fetch and checkout use only the reviewed commit, never a branch name", () => {
+test("git fetch and checkout use only the resolved commit sha, never a branch name", () => {
     const directory = "/builds/candidate";
     const repo = "https://github.com/CaviraOSS/LongMemory.git";
     assert.deepEqual(gitInitArgs(directory), ["init", "--quiet", directory]);
@@ -244,4 +264,77 @@ test("native smoke launches the candidate MCP with a throwaway database and requ
     const L = layout("linux", "/home/a");
     assert.equal(path.dirname(L.dbPath), path.dirname(L.longmemoryRoot));
     assert.equal(L.dbPath.includes(`${path.sep}builds${path.sep}`), false);
+});
+
+test("git ls-remote main parsing accepts exactly one refs/heads/main commit", () => {
+    assert.equal(parseLsRemoteMain(`${SHA_A}\trefs/heads/main\n`), SHA_A);
+    assert.equal(parseLsRemoteMain(`${SHA_B}\trefs/heads/mainline\r\n${SHA_A}\trefs/heads/main\r\n`), SHA_A);
+    assert.throws(() => parseLsRemoteMain(""), /exactly one refs\/heads\/main \(0 lines\)/);
+    assert.throws(() => parseLsRemoteMain(`${SHA_A}\trefs/heads/main\n${SHA_B}\trefs/heads/main\n`), /exactly one/);
+    assert.throws(() => parseLsRemoteMain("main\trefs/heads/main\n"), /not a commit sha/);
+});
+
+test("a newer commit's receipt counts only for a generated graph with its lock hash and a passed audit", () => {
+    withTemp("lms-lm-generated-", (root) => {
+        const candidate = path.join(root, buildDirectoryName(SHA_A, DEP_A));
+        finishBuild(candidate, SHA_A, DEP_A);
+        assert.equal(buildState(candidate, SHA_A, DEP_A), "complete");
+        for (const [label, overrides] of /** @type {[string, Record<string, unknown>][]} */ ([
+            ["a high advisory", { audit: { ...PASSED_AUDIT, high: 1 } }],
+            ["a critical advisory", { audit: { ...PASSED_AUDIT, critical: 2 } }],
+            ["a missing audit", { audit: null }],
+            ["an incomplete audit", { audit: { high: 0, critical: 0 } }],
+            ["another lock hash", { packageLockSha256: "0".repeat(64) }],
+            ["the reviewed source label", { source: "reviewed" }],
+        ])) {
+            stampBuild(candidate, SHA_A, DEP_A, overrides);
+            assert.equal(buildState(candidate, SHA_A, DEP_A), "partial", `${label} invalidates the receipt`);
+        }
+        const artifactFingerprint = buildArtifactFingerprint(candidate);
+        fs.writeFileSync(longMemoryStamp(candidate), `${JSON.stringify({ commit: SHA_A, dependencyFingerprint: DEP_A, artifactFingerprint })}\n`);
+        assert.equal(buildState(candidate, SHA_A, DEP_A), "partial", "a newer commit without a dependency graph record is not accepted");
+    });
+});
+
+test("the running build is whatever commit its verified receipt names, and the baseline needs the reviewed lock", () => {
+    withTemp("lms-lm-running-", (root) => {
+        const L = tree(root);
+        const generated = path.join(L.buildsDir, buildDirectoryName(SHA_A, FIXTURE_FINGERPRINT));
+        finishBuild(generated, SHA_A, FIXTURE_FINGERPRINT);
+        pointCurrentAt(generated, L, "linux");
+        assert.deepEqual(runningLongMemory(L, "linux"), { dir: generated, commit: SHA_A, dependencyFingerprint: FIXTURE_FINGERPRINT });
+        stampBuild(generated, SHA_A, FIXTURE_FINGERPRINT, { audit: { ...PASSED_AUDIT, high: 1 } });
+        assert.equal(runningLongMemory(L, "linux"), null);
+
+        const baselineWithOtherLock = path.join(L.buildsDir, buildDirectoryName(LONGMEMORY_COMMIT, FIXTURE_FINGERPRINT));
+        finishBuild(baselineWithOtherLock, LONGMEMORY_COMMIT, FIXTURE_FINGERPRINT);
+        pointCurrentAt(baselineWithOtherLock, L, "linux");
+        assert.equal(runningLongMemory(L, "linux"), null, "the baseline commit is accepted only with the committed lockfile");
+
+        const reviewedFingerprint = reviewedDependencyFingerprint("longmemory");
+        const reviewed = path.join(L.buildsDir, buildDirectoryName(LONGMEMORY_COMMIT, reviewedFingerprint));
+        finishBuild(reviewed, LONGMEMORY_COMMIT, reviewedFingerprint);
+        const paths = reviewedDependencyPaths("longmemory");
+        fs.copyFileSync(paths.packageJson, path.join(reviewed, "package.json"));
+        fs.copyFileSync(paths.packageLock, path.join(reviewed, "package-lock.json"));
+        // Receipts written before the dependency graph record existed stay valid for the baseline.
+        const artifactFingerprint = buildArtifactFingerprint(reviewed);
+        fs.writeFileSync(longMemoryStamp(reviewed), `${JSON.stringify({ commit: LONGMEMORY_COMMIT, dependencyFingerprint: reviewedFingerprint, artifactFingerprint })}\n`);
+        pointCurrentAt(reviewed, L, "linux");
+        assert.deepEqual(runningLongMemory(L, "linux"), { dir: reviewed, commit: LONGMEMORY_COMMIT, dependencyFingerprint: reviewedFingerprint });
+    });
+});
+
+test("the staging checkout of a newer commit is hidden from pruning", () => {
+    const staging = stagingCheckoutDir("/builds", SHA_A);
+    assert.equal(staging, path.join("/builds", `.candidate-${SHA_A}`));
+    assert.deepEqual(directoriesToRemove([path.basename(staging)], []), []);
+    assert.throws(() => stagingCheckoutDir("/builds", "main"), /not a commit sha/);
+});
+
+test("installing refuses a source that is not a commit sha", async () => {
+    await assert.rejects(
+        installLongMemoryCommit({ sha: "main", node: "/node", repo: "/repo", platform: "linux", tools: [], deferPrune: false, L: tree("/nonexistent") }),
+        /not a commit sha/,
+    );
 });

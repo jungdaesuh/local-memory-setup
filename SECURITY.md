@@ -15,24 +15,24 @@ keyless QMD and LongMemory HTTP listeners until the user approves and completes
 legacy listeners. Do not describe an existing installation as remediated until apply
 reports success and the connected agents use the migrated configuration.
 
-`--plan` and `--check` use local state and local probes. They do not query the npm
-registry, Git remotes or mutable upstream `main`, and they do not modify files or
-services. A `--plan` can report local health endpoints for a legacy setup; this is not an
-external network request. `--update` builds and switches to only the reviewed LongMemory
-source and dependency graph. It does not follow `main`, refresh arbitrary packages or
-replace the full `--apply` migration. Use it only after `--apply` completes initial setup
-or agent-configuration repair. Before writing, it blocks when private storage or the
-native launcher is unavailable, or the setup-owned legacy LongMemory service remains.
-Once those preconditions hold, it changes only the reviewed LongMemory build and leaves
-agent configurations and service registrations unchanged. Its `ready` result means that
-LongMemory build was updated; it does not certify full setup readiness.
+`--check` is offline: it uses local state and local probes only. `--plan`, `--apply` and
+`--update` also resolve LongMemory's `refs/heads/main` with `git ls-remote` (30 s timeout);
+`--plan` and `--check` never modify files or services. A `--plan` can report local health
+endpoints for a legacy setup; this is not an external network request. `--update` builds
+and switches LongMemory to the resolved `main` when it is not the running build. It does
+not refresh other packages or replace the full `--apply` migration. Use it only after
+`--apply` completes initial setup or agent-configuration repair. Before writing, it blocks
+when private storage or the native launcher is unavailable, or the setup-owned legacy
+LongMemory service remains. Once those preconditions hold, it changes only the LongMemory
+build and leaves agent configurations and service registrations unchanged. Its `ready`
+result means that LongMemory build was updated; it does not certify full setup readiness.
 
 ## Connections and trust boundaries
 
 - QMD and LongMemory are native stdio MCP child processes, each started by an agent's
   managed client configuration when that agent connects. The configuration passes the
   pinned Node executable, the setup launcher, the server name and the private runtime
-  record path. The launcher selects the reviewed executable, clears inherited QMD,
+  record path. The launcher selects the recorded executables, clears inherited QMD,
   LongMemory, OpenMemory, index and Ollama host overrides plus `NODE_OPTIONS` and
   `NODE_PATH`, and applies private storage permissions before spawning the server. Their
   memory requests travel over the agent-owned pipes; the managed design creates no
@@ -59,25 +59,38 @@ LongMemory build was updated; it does not certify full setup readiness.
   with a single `Set-Acl` call, then verifies the resulting ACL. It does not reset access
   with `icacls /reset` before granting access again.
 
-## Reviewed software inputs
+## Software inputs
 
 - QMD is pinned to `@tobilu/qmd` **2.8.3** in `dependencies/qmd/package.json` and its
-  committed npm lockfile.
-- LongMemory is pinned to source commit
-  `9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5`. Its reviewed root-only npm manifest and
-  lockfile are under `dependencies/longmemory/`; they preserve the pinned source root's
-  build and direct dependency versions and include the audited transitive fixes. The
-  installer uses `npm ci` against these committed lockfiles. It does not bootstrap pnpm,
-  resolve newer direct dependency ranges or build mutable upstream `main`.
-- The reviewed root manifest and lockfile are copied into the pinned source checkout and
-  consumed by `npm ci`. A build receipt then identifies the source commit, manifest and
-  lock, tracked source, generated output, LongMemory stdio bootstrap and npm's hidden
-  `.package-lock.json` graph metadata. The receipt must still match after the smoke test
-  and when a build is reused. It checks source/output/lock-resolution drift; it is not a
-  perpetual byte-level authenticity check for every file under `node_modules`.
-- The frozen upstream baseline listed 35 vulnerable LongMemory root paths. The reviewed
-  lock closes those paths, and auditing the committed production graphs with
-  `npm audit --omit=dev` found no production advisories.
+  committed npm lockfile, installed with `npm ci`.
+- LongMemory follows the latest `main` of `https://github.com/CaviraOSS/LongMemory.git`.
+  Each build fetches exactly the resolved commit. `dependencies/longmemory/` holds a
+  reviewed root-only manifest and lockfile for the baseline commit
+  `9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5` (`LONGMEMORY_COMMIT`); when `main` is that
+  commit, `npm ci` installs that committed lock. The upstream baseline's root graph listed
+  35 vulnerable paths; the reviewed lock closes them, and `npm audit --omit=dev` on it
+  reported no production advisories.
+- When `main` is any other commit, setup derives the root-only manifest the same way in
+  code (`scripts/longmemory_dependencies.mjs`): upstream's name, version, license,
+  engines, module fields and `build` script, with every direct dependency pinned to the
+  version upstream's `pnpm-lock.yaml` root importer resolved. Upstream overrides, a
+  lockfile that disagrees with `package.json`, or a non-registry version stop the update.
+  `npm install --package-lock-only --ignore-scripts` then resolves a fresh lock in the
+  candidate checkout, and `npm audit --omit=dev --json` checks it. Any **high** or
+  **critical** production advisory blocks the update: the step fails naming the commit
+  and advisories, nothing is installed, and the running build stays current. Moderate and
+  lower advisories are recorded but do not block. Only a passing graph is installed with
+  `npm ci` and built. Setup never bootstraps pnpm or installs the upstream workspace.
+- The generated manifest and lock stay at the root of that build directory, where
+  `npm ci` read them. The build receipt records the commit, the manifest/lock
+  fingerprint, the lock's SHA-256, the production audit counts and an artifact
+  fingerprint of the tracked source, generated output, LongMemory stdio bootstrap and
+  npm's hidden `.package-lock.json`. The receipt must match after the smoke test, on reuse
+  and whenever a build is reported current; a newer commit's build counts only with a
+  recorded passing audit. The receipt detects source/output/lock-resolution drift; it is
+  not a byte-level authenticity check for every file under `node_modules`.
+- Following `main` trusts upstream's source at that commit, as any build of it would. The
+  audit gate covers published dependency advisories; it does not review upstream code.
 
 Retrieval remains CPU-only. The managed QMD environment uses Metal for `qmd embed` on
 Apple Silicon and Vulkan elsewhere; this policy does not move Ollama or the memory MCP
@@ -94,8 +107,7 @@ that configuration with a generated one.
 LongMemory builds live separately from the database under
 `~/.local/share/local-memory-setup/longmemory/builds/`. The candidate build and its stdio
 smoke test must pass before the current pointer changes. The previously current build is
-retained as the previous build for rollback; a later reviewed update may prune older
-builds. The database at `~/.local/share/local-memory-setup/longmemory.db` is outside the
+retained as the previous build for rollback; a later update may prune older builds. The database at `~/.local/share/local-memory-setup/longmemory.db` is outside the
 build tree and is not deleted by migration or rollback.
 
 There is no automatic configuration rollback. To roll back a completed migration,
@@ -122,5 +134,5 @@ SHA-256 before execution.
 
 The LongMemory database is stored at
 `~/.local/share/local-memory-setup/longmemory.db`; QMD indexes only the folders selected
-by the user. Setup downloads reviewed software and models to the machine. Never store
+by the user. Setup downloads software and models to the machine. Never store
 secrets or `.env` contents in indexed folders or memory.
