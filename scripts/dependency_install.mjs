@@ -1,8 +1,9 @@
 /**
- * Install one reviewed dependency graph into a dedicated npm project root.
- * Copies the committed manifest and lockfile before running a clean `npm ci`.
- * LongMemory's reviewed root-only manifest intentionally replaces the clone's root manifest.
- * Returns the SHA-256 identity of the manifest and lockfile used for installation.
+ * Install one npm dependency graph into a dedicated npm project root with a clean `npm ci`.
+ * The reviewed graphs are the committed manifests and lockfiles under dependencies/;
+ * LongMemory's reviewed root-only manifest intentionally replaces the clone's root manifest
+ * for the reviewed baseline commit (see longmemory_dependencies.mjs for newer commits).
+ * Fingerprints identify the exact manifest and lockfile bytes used for installation.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -53,15 +54,22 @@ export function dependencyInstallPaths(component, target) {
  */
 export function reviewedDependencyFingerprint(component) {
     const paths = reviewedDependencyPaths(component);
-    const packageJson = fs.readFileSync(paths.packageJson);
-    const packageLock = fs.readFileSync(paths.packageLock);
-    return fingerprintBytes(component, packageJson, packageLock);
+    return dependencyFingerprint(component, fs.readFileSync(paths.packageJson), fs.readFileSync(paths.packageLock));
+}
+
+/**
+ * Identity of the manifest and lockfile an npm project root was installed from.
+ * @param {"qmd" | "longmemory"} component
+ * @param {string} projectRoot directory holding package.json and package-lock.json
+ */
+export function installedDependencyFingerprint(component, projectRoot) {
+    return dependencyFingerprint(component, fs.readFileSync(path.join(projectRoot, "package.json")), fs.readFileSync(path.join(projectRoot, "package-lock.json")));
 }
 
 /**
  * Copy a reviewed graph into an isolated npm project root and return its fingerprint.
  * @param {"qmd" | "longmemory"} component
- * @param {string} target project root; for LongMemory, the pinned source checkout root
+ * @param {string} target project root; for LongMemory, the baseline source checkout root
  */
 export function copyReviewedDependencyFiles(component, target) {
     const paths = reviewedDependencyPaths(component);
@@ -70,7 +78,16 @@ export function copyReviewedDependencyFiles(component, target) {
     fs.mkdirSync(target, { recursive: true });
     fs.writeFileSync(path.join(target, "package.json"), packageJson);
     fs.writeFileSync(path.join(target, "package-lock.json"), packageLock);
-    return fingerprintBytes(component, packageJson, packageLock);
+    return dependencyFingerprint(component, packageJson, packageLock);
+}
+
+/**
+ * Environment for npm commands run on behalf of setup: CI mode, with the selected Node first on PATH.
+ * @param {string} node the Node executable selected by setup
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function npmEnvironment(node) {
+    return { ...process.env, CI: "1", PATH: `${path.dirname(node)}${path.delimiter}${process.env.PATH ?? ""}` };
 }
 
 /**
@@ -80,16 +97,11 @@ export function copyReviewedDependencyFiles(component, target) {
  * @returns {{ command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv }}
  */
 export function npmCiInvocation(target, node) {
-    const env = {
-        ...process.env,
-        CI: "1",
-        PATH: `${path.dirname(node)}${path.delimiter}${process.env.PATH ?? ""}`,
-    };
     return {
         command: "npm",
         args: ["ci", "--no-audit", "--no-fund"],
         cwd: target,
-        env,
+        env: npmEnvironment(node),
     };
 }
 
@@ -102,6 +114,17 @@ export function npmCiInvocation(target, node) {
  */
 export function installReviewedDependencies(component, target, node) {
     const fingerprint = copyReviewedDependencyFiles(component, target);
+    installLockedDependencies(component, target, node);
+    return fingerprint;
+}
+
+/**
+ * Run `npm ci` against the manifest and lockfile already present at `target`.
+ * @param {"qmd" | "longmemory"} component
+ * @param {string} target project root containing package.json and package-lock.json
+ * @param {string} node the Node executable selected by setup
+ */
+export function installLockedDependencies(component, target, node) {
     const invocation = npmCiInvocation(target, node);
     const bytes = component === "qmd" ? QMD_PACKAGE_BYTES[process.platform] ?? QMD_PACKAGE_BYTES.linux : LONGMEMORY_BUILD_BYTES;
     run(invocation.command, invocation.args, {
@@ -110,11 +133,13 @@ export function installReviewedDependencies(component, target, node) {
         timeoutMs: installTimeoutMs(bytes),
         stream: true,
     });
-    return fingerprint;
 }
 
-/** @param {"qmd" | "longmemory"} component @param {Buffer} packageJson @param {Buffer} packageLock */
-function fingerprintBytes(component, packageJson, packageLock) {
+/**
+ * SHA-256 identity of one manifest and lockfile pair; build directories and receipts carry it.
+ * @param {"qmd" | "longmemory"} component @param {Buffer} packageJson @param {Buffer} packageLock
+ */
+export function dependencyFingerprint(component, packageJson, packageLock) {
     return createHash("sha256")
         .update(component)
         .update("\0package.json\0")

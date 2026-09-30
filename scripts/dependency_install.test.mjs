@@ -6,6 +6,7 @@ import test from "node:test";
 import {
     copyReviewedDependencyFiles,
     dependencyInstallPaths,
+    installedDependencyFingerprint,
     npmCiInvocation,
     reviewedDependencyFingerprint,
     reviewedDependencyPaths,
@@ -44,7 +45,7 @@ test("QMD and LongMemory have committed npm v3 lockfiles for their scoped graphs
 });
 
 test("copying a reviewed graph replaces only its npm project manifest and lockfile", () => {
-    for (const component of ["qmd", "longmemory"]) {
+    for (const component of /** @type {const} */ (["qmd", "longmemory"])) {
         const source = reviewedDependencyPaths(component);
         const target = fs.mkdtempSync(path.join(os.tmpdir(), `lms-${component}-deps-`));
         try {
@@ -57,6 +58,7 @@ test("copying a reviewed graph replaces only its npm project manifest and lockfi
             assert.equal(fs.readFileSync(path.join(target, "source.ts"), "utf8"), "preserve source\n");
             assert.match(copiedFingerprint, /^[0-9a-f]{64}$/);
             assert.equal(copiedFingerprint, reviewedDependencyFingerprint(component));
+            assert.equal(installedDependencyFingerprint(component, target), copiedFingerprint);
         } finally {
             fs.rmSync(target, { recursive: true, force: true });
         }
