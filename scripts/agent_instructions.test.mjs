@@ -21,13 +21,13 @@ import {
     grokPathsEditable,
     instructionsBlockCurrent,
     instructionsText,
+    instructedLongMemoryTools,
     isClaudeRulesDir,
     withGrokExtraRuleDir,
     withInstructionsBlock,
     withOpencodeInstruction,
 } from "./agent_instructions.mjs";
 import { detectAgents, detectInstructions } from "./detect.mjs";
-import { LONGMEMORY_COMMIT } from "./layout.mjs";
 import { applyAgentInstructions } from "./instructions_apply.mjs";
 import { layout } from "./layout.mjs";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -38,7 +38,7 @@ const tempDir = (prefix) => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 
 /* ------------------------------------------------------------ instructions text */
 
-// The tools LongMemory 9ee2c8e1 registers (docs/mcp.md "Tools", src/mcp/tools/*.ts) and QMD
+// The tools LongMemory registers (docs/mcp.md "Tools", src/mcp/tools/*.ts) and QMD
 // 2.5.3 serves (dist/mcp/server.js), listed from those sources, not from the text under test.
 const LONGMEMORY_TOOLS = [
     "longmemory_project_context", "longmemory_recall", "longmemory_ingest", "longmemory_remember_decision",
@@ -48,10 +48,10 @@ const LONGMEMORY_TOOLS = [
 // Tools whose schema (src/mcp/schemas/tool_schemas.ts) takes a project_id.
 const TAKES_PROJECT_ID = ["longmemory_project_context", "longmemory_recall", "longmemory_ingest", "longmemory_remember_decision"];
 
-test("every LongMemory tool the instructions name exists at the pinned commit", () => {
-    const named = [...new Set(TEXT.match(/longmemory_[a-z_]+/g) ?? [])];
-    assert.ok(named.length >= 4);
-    for (const tool of named) assert.ok(LONGMEMORY_TOOLS.includes(tool), `${tool} is not a LongMemory 9ee2c8e1 tool`);
+test("every LongMemory tool the instructions name is one LongMemory registers", () => {
+    const named = instructedLongMemoryTools();
+    assert.deepEqual(named, ["longmemory_project_context", "longmemory_recall", "longmemory_remember_decision", "longmemory_ingest"]);
+    for (const tool of named) assert.ok(LONGMEMORY_TOOLS.includes(tool), `${tool} is not a LongMemory tool`);
     // QMD 2.5.3 dist/mcp/server.js: tools query, get, multi_get, status; query takes searches of type lex, vec, hyde.
     const qmdLine = TEXT.split("\n").find((line) => line.includes("QMD: "));
     const qmdNamed = [...(qmdLine ?? "").matchAll(/`([a-z_]+)`/g)].map((match) => match[1]);
@@ -75,9 +75,8 @@ test("every instruction line that calls a project-scoped tool passes project_id,
     assert.ok(TEXT.includes(PROJECT_ID_RULE));
 });
 
-// LongMemory's own default project id, vendored verbatim from src/mcp/runtime.ts:44 at the
-// pinned commit (9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5); the next test checks this copy
-// against a checkout when one is available.
+// LongMemory's own default project id, vendored verbatim from src/mcp/runtime.ts:44.
+// The next test checks this copy against origin/main of the read-only upstream clone.
 const RUNTIME_TS_LINE = 44;
 const CURRENT_PROJECT_SOURCE = "const current_project = (cwd: string) => basename(resolve(cwd)).toLowerCase().replace(/[^a-z0-9._-]+/g, '-') || 'current';";
 
@@ -97,14 +96,14 @@ test("the project_id rule states LongMemory's own current_project normalization"
     assert.equal(stated[2], replacement);
 });
 
-const LONGMEMORY_CHECKOUT = process.env.LONGMEMORY_CHECKOUT ?? layout().sourceDir;
-const hasPinnedRuntime =
-    fs.existsSync(LONGMEMORY_CHECKOUT) && spawnSync("git", ["-C", LONGMEMORY_CHECKOUT, "cat-file", "-e", `${LONGMEMORY_COMMIT}:src/mcp/runtime.ts`], { stdio: "ignore" }).status === 0;
+const LONGMEMORY_UPSTREAM = process.env.LONGMEMORY_CHECKOUT ?? "/home/jungdaesuh/code/opensource/OpenMemory";
+const hasUpstreamRuntime =
+    fs.existsSync(LONGMEMORY_UPSTREAM) && spawnSync("git", ["-C", LONGMEMORY_UPSTREAM, "cat-file", "-e", "origin/main:src/mcp/runtime.ts"], { stdio: "ignore" }).status === 0;
 test(
-    "the vendored current_project line is the pinned commit's runtime.ts line, read-only from a LongMemory checkout",
-    { skip: !hasPinnedRuntime && `no LongMemory checkout with ${LONGMEMORY_COMMIT} at ${LONGMEMORY_CHECKOUT} (set LONGMEMORY_CHECKOUT)` },
+    "the vendored current_project line is origin/main's runtime.ts line, read with git show",
+    { skip: !hasUpstreamRuntime && `no origin/main runtime.ts at ${LONGMEMORY_UPSTREAM} (set LONGMEMORY_CHECKOUT)` },
     () => {
-        const source = execFileSync("git", ["-C", LONGMEMORY_CHECKOUT, "show", `${LONGMEMORY_COMMIT}:src/mcp/runtime.ts`], { encoding: "utf8" });
+        const source = execFileSync("git", ["-C", LONGMEMORY_UPSTREAM, "show", "origin/main:src/mcp/runtime.ts"], { encoding: "utf8" });
         assert.equal(source.split("\n")[RUNTIME_TS_LINE - 1], CURRENT_PROJECT_SOURCE);
     },
 );

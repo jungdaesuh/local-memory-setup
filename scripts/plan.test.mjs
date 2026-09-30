@@ -6,7 +6,9 @@ import {
     foldersToAdd,
     checkReport,
     effectiveQmdModels,
+    isLongMemoryAction,
     lockedTiers,
+    longMemoryRestartPending,
     newNotesFolder,
     planActions,
     recommendedChoices,
@@ -17,6 +19,7 @@ import {
     totals,
     validateChoices,
 } from "./plan.mjs";
+import { LONGMEMORY_BUILD_BYTES } from "./sizes.mjs";
 
 const GIB = 1024 * 1024 * 1024;
 const QWEN06 = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
@@ -275,7 +278,10 @@ test("fresh Linux without sudo: Ollama's install is the admin step, with its exa
     const plan = buildPlan(facts());
     const install = find(plan.actions, "install-ollama");
     assert.equal(install.needsAdmin, true);
-    assert.equal(install.adminCommand, "curl -fsSL -o ollama-install.sh https://ollama.com/install.sh && OLLAMA_VERSION=0.34.4 sh ollama-install.sh");
+    assert.equal(
+        install.adminCommand,
+        'curl -fsSL -o install.sh https://raw.githubusercontent.com/ollama/ollama/v0.34.4/scripts/install.sh && echo "25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f  install.sh" | sha256sum -c - && OLLAMA_VERSION=0.34.4 sh install.sh',
+    );
     assert.match(install.summary, /ROCm.*NVIDIA's driver packages/);
     assert.equal(plan.totals.needsAdmin, true);
     assert.equal(plan.detected.ollama.owner.owner, "system-unit");
@@ -720,4 +726,42 @@ test("only installs and rebuilds need Node 22.15; repairs that build nothing do 
     assert.deepEqual(stepsNeedingNewerNode(pending, "22.12.0"), ["install-longmemory", "rebuild-qmd"]);
     assert.deepEqual(stepsNeedingNewerNode(pending, "22.15.0"), []);
     assert.deepEqual(stepsNeedingNewerNode([{ id: "start-qmd" }, { id: "connect-claude" }], "22.12.0"), []);
+});
+
+test("LongMemory main is named when resolved, and a build behind it is rebuilt and restarted", () => {
+    const main = "0123456789abcdef0123456789abcdef01234567";
+    const current = "fedcba9876543210fedcba9876543210fedcba98";
+    const offline = find(planActions(facts(), SAVED), "install-longmemory");
+    assert.equal(offline.alreadyDone, false);
+    assert.equal(offline.problem, "LongMemory is not built.");
+    assert.equal(offline.downloadBytes, LONGMEMORY_BUILD_BYTES);
+    assert.doesNotMatch(offline.summary, /main @/);
+
+    const installed = healthyFacts();
+    const behind = { ...installed, longmemory: { ...installed.longmemory, built: true, current, main, healthy: true } };
+    const install = find(planActions(behind, SAVED), "install-longmemory");
+    assert.equal(install.alreadyDone, false);
+    assert.match(install.summary, /LongMemory main @ 0123456789ab/);
+    assert.match(install.summary, /The running build is fedcba987654\./);
+    assert.equal(install.downloadBytes, LONGMEMORY_BUILD_BYTES);
+    assert.equal(install.problem, "LongMemory is not running main @ 0123456789ab.");
+    const start = find(planActions(behind, SAVED), "start-longmemory");
+    assert.equal(start.alreadyDone, false);
+    assert.equal(start.summary, "Restart the LongMemory server on LongMemory main @ 0123456789ab.");
+    assert.equal(longMemoryRestartPending(behind), true);
+
+    const same = { ...installed, longmemory: { ...installed.longmemory, built: true, current: main, main } };
+    const done = find(planActions(same, SAVED), "install-longmemory");
+    assert.equal(done.alreadyDone, true);
+    assert.equal(done.summary, "LongMemory main @ 0123456789ab is the running build.");
+    assert.equal(done.downloadBytes, 0);
+    assert.equal(find(planActions(same, SAVED), "start-longmemory").alreadyDone, true);
+
+    const foreign = facts({ longmemory: { built: false, healthy: true, main, envFile: false, dbExists: false } });
+    assert.equal(find(planActions(foreign, SAVED), "start-longmemory").alreadyDone, true);
+    assert.match(find(planActions(foreign, SAVED), "install-longmemory").summary, /No LongMemory build is running/);
+    assert.equal(isLongMemoryAction("install-longmemory"), true);
+    assert.equal(isLongMemoryAction("rebuild-longmemory"), true);
+    assert.equal(isLongMemoryAction("start-longmemory"), true);
+    assert.equal(isLongMemoryAction("start-qmd"), false);
 });

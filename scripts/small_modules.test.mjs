@@ -91,9 +91,12 @@ test("command line: one mode, apply needs exactly one input", () => {
     assert.deepEqual(parseArgs(["--plan"]), { mode: "--plan", yes: false, choicesFile: undefined });
     assert.deepEqual(parseArgs(["--apply", "--yes"]), { mode: "--apply", yes: true, choicesFile: undefined });
     assert.deepEqual(parseArgs(["--apply", "--choices", "c.json"]), { mode: "--apply", yes: false, choicesFile: "c.json" });
-    for (const bad of [["--apply"], ["--apply", "--yes", "--choices", "c.json"], ["--plan", "--apply"], ["--plan", "--yes"], ["--apply", "--choices"], ["--apply", "--choices", "--yes"], ["--frobnicate"]]) {
+    assert.deepEqual(parseArgs(["--update"]), { mode: "--update", yes: false, choicesFile: undefined });
+    for (const bad of [["--apply"], ["--apply", "--yes", "--choices", "c.json"], ["--plan", "--apply"], ["--plan", "--yes"], ["--apply", "--choices"], ["--apply", "--choices", "--yes"], ["--frobnicate"], ["--check", "--update"], ["--update", "--yes"], ["--update", "--choices", "c.json"]]) {
         assert.throws(() => parseArgs(bad), UsageError, bad.join(" "));
     }
+    assert.throws(() => parseArgs(["--plan", "--update"]), /Use one of --plan, --apply, --check, --update/);
+    assert.throws(() => parseArgs(["--update", "--yes"]), /--yes and --choices only go with --apply/);
 });
 
 test("install time limits grow with the download and leave room to build", () => {

@@ -4,7 +4,7 @@
  * exits 0 once Ollama's GET /api/tags lists <model>, or 1 after <seconds>. The service
  * manager (or the Windows runner loop) then starts the runner again.
  *
- * LongMemory 9ee2c8e1 does not probe its embedding provider at startup, and a failed
+ * LongMemory does not probe its embedding provider at startup, and a failed
  * Ollama call falls through to a synthetic embedder (src/core/embeddings/stack.ts).
  * Waiting for the model itself, not only for the port, keeps a boot-time race or a
  * missing model from writing synthetic vectors. A later Ollama outage still falls back

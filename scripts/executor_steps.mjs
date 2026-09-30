@@ -37,8 +37,8 @@ export function ollamaStartStep(state) {
 
 /**
  * The file whose exported symbol names the Node ABI a component's native modules were
- * built for (better-sqlite3 exports node_register_module_v<ABI>; QMD 2.5.3 and LongMemory
- * 9ee2c8e1 both depend on it). node-llama-cpp uses Node-API and does not depend on the ABI.
+ * built for (better-sqlite3 exports node_register_module_v<ABI>; QMD and LongMemory
+ * both depend on it). node-llama-cpp uses Node-API and does not depend on the ABI.
  * @param {"qmd" | "longmemory"} component
  * @param {{ qmdPackage: string, sourceDir: string }} L
  */

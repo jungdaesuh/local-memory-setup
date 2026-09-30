@@ -17,7 +17,8 @@ import { codexInstructionsTarget, instructionsBlockCurrent, instructionsText } f
 import { nativeModuleAbi, nativeModuleFile } from "./executor_steps.mjs";
 import { readIfExists } from "./fs_util.mjs";
 import { longMemoryHealthy, ollamaModelNames, qmdHealthy } from "./health.mjs";
-import { LONGMEMORY_COMMIT, LONGMEMORY_HEALTH_URL, MARKER, OLLAMA_TAGS_URL, QMD_HEALTH_URL, SERVICE_NAMES, SQLITE_URI_NODE } from "./layout.mjs";
+import { LONGMEMORY_HEALTH_URL, LONGMEMORY_REPO, MARKER, OLLAMA_TAGS_URL, QMD_HEALTH_URL, SERVICE_NAMES, SQLITE_URI_NODE } from "./layout.mjs";
+import { resolveLongMemoryMain, runningLongMemory } from "./longmemory_build.mjs";
 import { parseEnvFile } from "./longmemory_env.mjs";
 import { jsonServerNames, serverDefined } from "./mcp_config.mjs";
 import { QMD_DEFAULT_MODELS } from "./model_choice.mjs";
@@ -222,8 +223,8 @@ export function queryReadOnly(dbPath, sql) {
 }
 
 /**
- * Stored LongMemory memories (rows of hydro_nodes, src/stores/sqlite/schema.sql at the
- * pinned commit), counted read-only in a child process so node:sqlite's experimental
+ * Stored LongMemory memories (rows of hydro_nodes, src/stores/sqlite/schema.sql),
+ * counted read-only in a child process so node:sqlite's experimental
  * warning stays out of this process's output. Null when the database could not be read.
  * @param {string} dbPath
  * @returns {number | null}
@@ -429,7 +430,8 @@ export function qmdInstalledBySetup(packageDir, L, stampText, packageJsonText) {
 
 /**
  * @param {Layout} L
- * @param {{ probeAdmin: boolean }} options
+ * `resolveMain` asks the network for refs/heads/main. The health check leaves it false.
+ * @param {{ probeAdmin: boolean, resolveMain: boolean }} options
  * @returns {Promise<Facts>}
  */
 export async function detectFacts(L, options) {
@@ -444,7 +446,6 @@ export async function detectFacts(L, options) {
     const qmdEntry = qmdPackageDir === null ? null : qmdEntryIn(qmdPackageDir);
     const indexYaml = readIfExists(L.qmdIndexConfig);
     const configModels = indexYaml === null ? null : qmdConfiguredModels(indexYaml);
-    const stamp = readIfExists(L.buildStamp);
     const savedText = readIfExists(L.choicesPath);
     const saved = savedText === null ? null : parseNamedJson(L.choicesPath, savedText);
     const savedAgents = new Set(typeof saved === "object" && saved !== null && Array.isArray(/** @type {{ agents?: unknown }} */ (saved).agents) ? /** @type {{ agents: AgentId[] }} */ (saved).agents : []);
@@ -465,8 +466,11 @@ export async function detectFacts(L, options) {
     const modelUris = [...new Set(Object.values({ ...QMD_DEFAULT_MODELS, ...(configModels ?? {}) }))];
     const cacheFiles = modelUris.map((uri) => /** @type {const} */ ([uri, qmdModelCacheFile(uri)]));
     const qmdInstallStamp = readIfExists(L.qmdInstallStamp);
+    const running = runningLongMemory(L, process.platform);
+    const main = options.resolveMain ? resolveLongMemoryMain(LONGMEMORY_REPO) : undefined;
     const abiOf = (component) => {
-        const file = nativeModuleFile(component, { qmdPackage: qmdPackageDir ?? L.qmdPackage, sourceDir: L.sourceDir });
+        const sourceDir = running === null ? path.join(L.buildsDir, "absent") : running.dir;
+        const file = nativeModuleFile(component, { qmdPackage: qmdPackageDir ?? L.qmdPackage, sourceDir });
         return fs.existsSync(file) ? nativeModuleAbi(fs.readFileSync(file)) : null;
     };
     const [qmdAbi, longMemoryAbi] = [abiOf("qmd"), abiOf("longmemory")];
@@ -524,7 +528,9 @@ export async function detectFacts(L, options) {
             ...(qmdAbi === null ? {} : { nativeAbi: qmdAbi }),
         },
         longmemory: {
-            built: stamp !== null && stamp.trim() === LONGMEMORY_COMMIT && fs.existsSync(L.cli),
+            built: running !== null,
+            ...(running === null ? {} : { current: running.commit }),
+            ...(main === undefined ? {} : { main }),
             healthy: longMemoryHealthy(longMemoryBody),
             envFile: envText !== null,
             ...(env.LONGMEMORY_OLLAMA_EMBEDDING_MODEL === undefined ? {} : { envModel: env.LONGMEMORY_OLLAMA_EMBEDDING_MODEL }),

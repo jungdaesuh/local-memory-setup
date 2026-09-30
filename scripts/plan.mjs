@@ -8,7 +8,8 @@
  * `blocker` that stops apply before any change.
  */
 import path from "node:path";
-import { LONGMEMORY_COMMIT, MIN_NODE, OLLAMA_VERSION, QMD_COMPATIBLE_VERSIONS, QMD_VERSION, ollamaAdminCommand } from "./layout.mjs";
+import { MIN_NODE, OLLAMA_VERSION, QMD_COMPATIBLE_VERSIONS, QMD_VERSION, ollamaAdminCommand } from "./layout.mjs";
+import { shortSha } from "./longmemory_build.mjs";
 import { nodeAtLeast } from "./platform.mjs";
 import { MODEL_TIERS, QMD_DEFAULT_MODELS, TIER_IDS, recommendTier } from "./model_choice.mjs";
 import { grokInstructionMode } from "./agent_instructions.mjs";
@@ -38,7 +39,9 @@ const AGENT_LABELS = { claude: "Claude Code", codex: "Codex", grok: "Grok", open
  * documents without vectors, qmd.nativeAbi/longmemory.nativeAbi/nodeAbi unless the native
  * module or the setup's Node was found, instructions before detection has looked (tests),
  * longmemory.envFile/envModel/dbExists before detection has
- * looked (tests), longmemory.storedMemories unless the database was counted,
+ * looked (tests), longmemory.main unless detection resolved refs/heads/main,
+ * longmemory.current unless a finished build is current,
+ * longmemory.storedMemories unless the database was counted,
  * longmemory.memoryCountUnknown unless a database exists that could not be counted,
  * staleServices unless one of the setup's own services runs an out-of-date runner,
  * withoutSystemd unless Linux runs without systemd as PID 1, selfLingerAllowed unless
@@ -66,7 +69,7 @@ const AGENT_LABELS = { claude: "Claude Code", codex: "Codex", grok: "Grok", open
  *     packageDir?: string,
  *     modelCache?: { cached: string[], unknown: string[] },
  *   },
- *   longmemory: { built: boolean, healthy: boolean, envFile?: boolean, envModel?: string, dbExists?: boolean, storedMemories?: number, memoryCountUnknown?: boolean, nativeAbi?: string },
+ *   longmemory: { built: boolean, healthy: boolean, main?: string, current?: string, envFile?: boolean, envModel?: string, dbExists?: boolean, storedMemories?: number, memoryCountUnknown?: boolean, nativeAbi?: string },
  *   instructions?: {
  *     shared: boolean, claudeRules: boolean, claudeRulesExists: boolean, claudeRulesSeenByGrok: boolean,
  *     grokCompatRules: boolean | "unsupported", grokImportsClaudeRules: boolean, grokExtraDir: boolean, grokEditable: boolean,
@@ -358,6 +361,92 @@ function serverAction(facts, id, label, healthy, registered, startWhen) {
     });
 }
 
+/** LongMemory steps `--update` runs, and the only ones it treats as remaining afterwards. */
+const LONGMEMORY_ACTIONS = ["install-longmemory", "rebuild-longmemory", "start-longmemory"];
+
+/** @param {string} id */
+export function isLongMemoryAction(id) {
+    return LONGMEMORY_ACTIONS.includes(id);
+}
+
+/**
+ * The setup's own LongMemory service must restart when it is down, its runner is stale,
+ * or it is not the resolved main. A healthy server this setup did not register is left
+ * alone: a second one would crash-loop on the port. Without a resolved main (the offline
+ * check), "behind" is not a reason to restart.
+ * @param {Facts} facts
+ */
+export function longMemoryRestartPending(facts) {
+    const registered = facts.services.longmemory;
+    const stale = registered && (facts.staleServices ?? []).includes("longmemory");
+    const behind = facts.longmemory.main !== undefined && facts.longmemory.current !== facts.longmemory.main;
+    if (registered) return !facts.longmemory.healthy || stale || behind;
+    return !facts.longmemory.healthy;
+}
+
+/**
+ * Build the resolved main when detection fetched it; otherwise only look at the running build.
+ * @param {Facts} facts
+ */
+function longMemoryInstallAction(facts) {
+    const { built, main, current } = facts.longmemory;
+    if (main === undefined) {
+        return action({
+            id: "install-longmemory",
+            summary: "Download and build LongMemory, a memory server your AI agents save to and recall from.",
+            downloadBytes: built ? 0 : LONGMEMORY_BUILD_BYTES,
+            alreadyDone: built,
+            problem: "LongMemory is not built.",
+        });
+    }
+    const short = shortSha(main);
+    const differs = !built || current !== main;
+    const running = current === undefined ? "No LongMemory build is running." : `The running build is ${shortSha(current)}.`;
+    return action({
+        id: "install-longmemory",
+        summary: differs ? `Build LongMemory main @ ${short}. ${running}` : `LongMemory main @ ${short} is the running build.`,
+        downloadBytes: differs ? LONGMEMORY_BUILD_BYTES : 0,
+        alreadyDone: !differs,
+        problem: `LongMemory is not running main @ ${short}.`,
+    });
+}
+
+/**
+ * Restart onto the build install-longmemory just switched to. A foreign healthy server
+ * stays already done even when main is ahead of anything this setup built.
+ * @param {Facts} facts
+ * @param {string} startWhen
+ */
+function longMemoryServerAction(facts, startWhen) {
+    const registered = facts.services.longmemory;
+    const healthy = facts.longmemory.healthy;
+    const stale = registered && (facts.staleServices ?? []).includes("longmemory");
+    const pending = longMemoryRestartPending(facts);
+    const behind = facts.longmemory.main !== undefined && facts.longmemory.current !== facts.longmemory.main;
+    const short = facts.longmemory.main === undefined ? null : shortSha(facts.longmemory.main);
+    const summary =
+        behind && registered && short !== null
+            ? `Restart the LongMemory server on LongMemory main @ ${short}.`
+            : stale
+              ? "Update the LongMemory server to this setup's current settings and restart it."
+              : healthy && !registered
+                ? "Leave the LongMemory server as it is: it is already running, started outside this setup."
+                : `Start the LongMemory server and have it start again ${startWhen}.`;
+    const problem =
+        behind && short !== null
+            ? `The LongMemory server is not running main @ ${short}.`
+            : stale
+              ? "The LongMemory server runs out-of-date settings."
+              : "The LongMemory server is not running.";
+    return action({
+        id: "start-longmemory",
+        summary,
+        alreadyDone: !pending,
+        blocker: pending && facts.withoutSystemd === true ? NO_SYSTEMD : null,
+        problem,
+    });
+}
+
 /**
  * Parts of a dotted version, for ordering releases.
  * @param {string} version
@@ -553,13 +642,7 @@ export function planActions(facts, choices) {
     const actions = [
         qmdInstallAction(facts),
         rebuildAction(facts, "qmd"),
-        action({
-            id: "install-longmemory",
-            summary: "Download and build LongMemory, a memory server your AI agents save to and recall from.",
-            downloadBytes: LONGMEMORY_BUILD_BYTES,
-            alreadyDone: facts.longmemory.built,
-            problem: `LongMemory is not built at commit ${LONGMEMORY_COMMIT.slice(0, 8)}.`,
-        }),
+        longMemoryInstallAction(facts),
         rebuildAction(facts, "longmemory"),
         ollamaInstallAction(facts),
         action({
@@ -609,7 +692,7 @@ export function planActions(facts, choices) {
             problem: "QMD's index has no search model set.",
         }),
         serverAction(facts, "start-qmd", "QMD's search server", facts.qmd.healthy, facts.services.qmd, startWhen),
-        serverAction(facts, "start-longmemory", "the LongMemory server", facts.longmemory.healthy, facts.services.longmemory, startWhen),
+        longMemoryServerAction(facts, startWhen),
         ...choices.agents.map((id) =>
             action({
                 id: `connect-${id}`,

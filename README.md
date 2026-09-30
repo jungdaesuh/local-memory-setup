@@ -1,7 +1,8 @@
 # Local memory setup
 
 A shareable agent skill. After the user agrees, it installs QMD (search over your notes),
-CaviraOSS LongMemory (agent memory, built from commit `9ee2c8e1`), and Ollama (runs
+CaviraOSS LongMemory (agent memory, built from the current `main` of
+https://github.com/CaviraOSS/LongMemory), and Ollama (runs
 LongMemory's embedding model). It picks free local models for the hardware, registers the
 servers to start again after a reboot, and connects Claude Code, Codex, Grok, and OpenCode.
 
@@ -9,10 +10,11 @@ servers to start again after a reboot, and connects Claude Code, Codex, Grok, an
 
 | Command | What it does |
 |---|---|
-| `node scripts/ensure.mjs` or `--check` | Health check, no changes. Exit 0 with no output when healthy; otherwise exit 3 and `{healthy, installed, problems, repairActions}`. |
-| `node scripts/ensure.mjs --plan` | Detects OS, hardware, disk, installed agents and components, and admin access. Prints the plan: recommended choices, options with download sizes, ordered actions, totals. No changes. |
-| `node scripts/ensure.mjs --apply --choices FILE` | Validates FILE against the plan (see SKILL.md), then runs only the pending actions. |
+| `node scripts/ensure.mjs` or `--check` | Health check, no changes and no network. Exit 0 with no output when healthy; otherwise exit 3 and `{healthy, installed, problems, repairActions}`. Reports whether the running LongMemory build is healthy. |
+| `node scripts/ensure.mjs --plan` | Detects OS, hardware, disk, installed agents and components, and admin access, and resolves LongMemory `main`. Prints the plan: recommended choices, options with download sizes, ordered actions, totals, and `LongMemory main @ <short sha>` when that commit differs from the running build. No changes. |
+| `node scripts/ensure.mjs --apply --choices FILE` | Validates FILE against the plan (see SKILL.md), then runs only the pending actions, including a LongMemory update when `main` moved. |
 | `node scripts/ensure.mjs --apply --yes` | Same, with the saved choices when a setup exists (agents no longer installed are left out), otherwise the plan's recommended choices. This is also the repair command. For IT or scripted installs. |
+| `node scripts/ensure.mjs --update` | Resolves LongMemory `main` and runs only the LongMemory actions (build, smoke-test, switch, restart). Does not save choices. Same consent as `--apply`. |
 
 Exit codes: 0 done or healthy, 1 failed or blocked, 2 an admin step is needed (the JSON
 lists the exact commands), 3 unhealthy, 64 bad arguments. Apply is idempotent: finished
@@ -99,7 +101,7 @@ block, and `--apply --yes` repairs it.
 
 | | QMD and LongMemory | Ollama |
 |---|---|---|
-| Linux | systemd user units (`local-memory-*.service`, `Restart=always`). At boot when `bootMode` is `boot` (systemd linger); otherwise at login. Needs systemd as PID 1; WSL without systemd and containers are reported as blocked. | The system `ollama.service` from the official install.sh (pinned to Ollama 0.34.4) starts at boot. Without that unit, a skill user unit runs `ollama serve` alongside QMD and LongMemory. With an AMD card install.sh also downloads ROCm (about 1.1 GB); with an NVIDIA card and no working driver it installs NVIDIA's driver packages. |
+| Linux | systemd user units (`local-memory-*.service`, `Restart=always`). At boot when `bootMode` is `boot` (systemd linger); otherwise at login. Needs systemd as PID 1; WSL without systemd and containers are reported as blocked. | The system `ollama.service` from Ollama 0.34.4's tagged `scripts/install.sh` starts at boot. The file's SHA-256 is checked before it runs as root. Without that unit, a skill user unit runs `ollama serve` alongside QMD and LongMemory. With an AMD card install.sh also downloads ROCm (about 1.1 GB); with an NVIDIA card and no working driver it installs NVIDIA's driver packages. |
 | macOS | LaunchAgents (`com.local-memory-setup.*`, `RunAtLoad`, `KeepAlive`). At login. | Installed with the Homebrew `ollama` formula (headless) and run by a skill LaunchAgent at login. If the Ollama app or `brew services` already runs Ollama, that stays the only owner. |
 | Windows | Task Scheduler logon tasks (`LocalMemory*`), no time limit, run on battery, started through `powershell.exe -WindowStyle Hidden` so no console window stays open (it may show for an instant at logon). The runner restarts its server itself; Task Scheduler's restart-on-failure is not relied on to rerun an exited process. At logon. | winget installs the official Ollama app, whose login item starts it. A standalone `ollama.exe` gets a skill logon task instead. |
 
@@ -115,7 +117,8 @@ it); this is upstream behavior that cannot be switched off.
 | QMD MCP | `http://localhost:8181/mcp` (QMD listens on the name `localhost`) |
 | LongMemory MCP | `http://127.0.0.1:7331/mcp`. Local only, no key: LongMemory listens on 127.0.0.1 only (`LONGMEMORY_HOST=127.0.0.1` in its settings), and its service unsets `LONGMEMORY_API_KEY`/`OM_API_KEY`, so it runs keyless. |
 | QMD | `~/.local` (npm global prefix); an existing supported or newer one there, behind `qmd` on PATH, or in npm's global folder is used as is |
-| LongMemory source and build | `~/.local/share/local-memory-setup/LongMemory` |
+| LongMemory builds | `~/.local/share/local-memory-setup/longmemory/builds/<commit>`. `longmemory/current` is a symlink to the running build (on Windows, `longmemory/current.txt` is a pointer the runner reads). A new `main` is built in its own directory, smoke-tested (health, the MCP tools the instructions name, and the service's `serve` arguments), and switched only if that passes. The running build is left in place on failure. After a successful switch, older builds are removed; the current and previous builds are kept. |
+| LongMemory database | `~/.local/share/local-memory-setup/longmemory.db`, outside the build directories, so a switch does not touch stored memories |
 | LongMemory settings | `~/.config/local-memory-setup/longmemory.env` (host, port, database, embedding model; no key) |
 | Saved choices | `~/.config/local-memory-setup/choices.json` |
 | `qmd` command | `~/.local/libexec/local-memory-setup/qmd`, added to PATH unless another `qmd` is already first on PATH. It runs QMD on the Node that installed it. `qmd embed` uses the GPU when there is one (Metal on Apple silicon, Vulkan elsewhere); every other command runs on the CPU. |
@@ -134,10 +137,16 @@ needs 22.13; official builds before 22.15 cannot open the read-only SQLite URIs 
 uses). `--plan`, `--check`, and repairs that install nothing run on an older Node 22: the
 plan notes it, and whether folders are fully indexed is judged by QMD collection
 membership alone. Also npm and git; curl on Linux;
-Homebrew on macOS; winget on Windows; zstd and tar on Linux (install.sh needs them). The Linux Ollama installer needs the admin password
-once (the printed command is pinned to Ollama 0.34.4, like the automated one), and so does start-at-boot unless polkit allows it. Apply never waits on a password
+Homebrew on macOS; winget on Windows; zstd and tar on Linux (install.sh needs them). The Linux Ollama installer is downloaded from `https://raw.githubusercontent.com/ollama/ollama/v0.34.4/scripts/install.sh`, checked against the SHA-256 pinned next to `OLLAMA_VERSION`, and only then run. It needs the admin password
+once (the printed command is the same download, `sha256sum -c`, and run), and so does start-at-boot unless polkit allows it. Apply never waits on a password
 prompt: when the Ollama step needs one, it stops before changing anything; when only
 start-at-boot needs one, it finishes the rest first. Either way it prints the exact command.
+
+## Supply chain
+
+QMD's npm version is pinned (`@tobilu/qmd@2.5.3`), but its dependencies are resolved by npm at install time and run install scripts.
+
+Ollama's Linux installer is the `scripts/install.sh` file from the `v0.34.4` tag. Its SHA-256 is pinned in `scripts/layout.mjs` and checked before the file runs as root. LongMemory is the current `main` commit, built into its own directory and switched only after the smoke test above.
 
 ## Tests
 

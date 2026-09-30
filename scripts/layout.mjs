@@ -1,7 +1,11 @@
 /**
  * Where everything lives and which versions are installed. Single source for
  * paths, ports, URLs, and pinned upstream versions; detection and apply both read it.
+ * LongMemory is not pinned to one commit: apply builds the current `main` of
+ * LONGMEMORY_REPO (see longmemory_build.mjs).
  */
+import { createHash } from "node:crypto";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { npmGlobalBin, npmGlobalBinDir } from "./platform.mjs";
@@ -15,10 +19,9 @@ export const QMD_VERSION = "2.5.3";
  * listen on QMD_HOST ?? "localhost", cli ensureModelsConfiguredForCli).
  */
 export const QMD_COMPATIBLE_VERSIONS = ["2.5.3", "2.8.3"];
-export const LONGMEMORY_COMMIT = "9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5";
 export const LONGMEMORY_REPO = "https://github.com/CaviraOSS/LongMemory.git";
 /**
- * Node needed to install or rebuild QMD and LongMemory: pnpm 11.5.2 (the pinned commit's
+ * Node needed to install or rebuild QMD and LongMemory: pnpm 11.5.2 (LongMemory's
  * packageManager) needs >=22.13, and the setup reads its databases read-only through
  * SQLite URI filenames (`file:...?immutable=1`), which official Node builds support from
  * 22.15. A health check on an older Node works; it reports those checks as unknown.
@@ -36,16 +39,70 @@ export const OLLAMA_ORIGIN = "http://127.0.0.1:11434";
 export const OLLAMA_HOST = new URL(OLLAMA_ORIGIN).host;
 /** Release the Linux install.sh is pinned to (OLLAMA_VERSION; github.com/ollama/ollama releases/latest on 2026-09-29). */
 export const OLLAMA_VERSION = "0.34.4";
-export const OLLAMA_INSTALL_SCRIPT_URL = "https://ollama.com/install.sh";
+/**
+ * SHA-256 of https://raw.githubusercontent.com/ollama/ollama/v0.34.4/scripts/install.sh
+ * downloaded 2026-09-30 (`curl -fsSL <url> | sha256sum`). The installer is that tagged
+ * file, not https://ollama.com/install.sh, and it is not run unless this matches.
+ */
+export const OLLAMA_INSTALL_SHA256 = "25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f";
 
 /**
- * The Linux Ollama install for a user to run in a terminal, pinned like the automated
- * path (install.sh reads OLLAMA_VERSION into its download URLs). Downloaded to a file
- * first so a failed download stops the command instead of running an empty script.
+ * install.sh from the git tag of `version`. install.sh reads OLLAMA_VERSION into its download URLs.
+ * @param {string} version
+ */
+export function ollamaInstallScriptUrl(version) {
+    return `https://raw.githubusercontent.com/ollama/ollama/v${version}/scripts/install.sh`;
+}
+
+/** @param {string} file */
+export function fileSha256(file) {
+    return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+/**
+ * Refuse a downloaded installer whose hash is not the pin. Callers run the file only after this returns.
+ * @param {string} actual
+ * @param {string} expected
+ */
+export function assertSha256Match(actual, expected) {
+    if (actual !== expected) {
+        throw new Error(`Ollama installer SHA-256 is ${actual}, not the pinned ${expected}. The installer was not run.`);
+    }
+}
+
+/**
+ * The Linux Ollama install for a user to run in a terminal: download the tagged script,
+ * check the pinned SHA-256, then run it. A mismatch makes `sha256sum -c` fail, so `sh` does not run.
  * @param {string} version
  */
 export function ollamaAdminCommand(version) {
-    return `curl -fsSL -o ollama-install.sh ${OLLAMA_INSTALL_SCRIPT_URL} && OLLAMA_VERSION=${version} sh ollama-install.sh`;
+    if (version !== OLLAMA_VERSION) throw new Error(`Ollama installer is pinned to ${OLLAMA_VERSION}, not ${version}.`);
+    const url = ollamaInstallScriptUrl(version);
+    return `curl -fsSL -o install.sh ${url} && echo "${OLLAMA_INSTALL_SHA256}  install.sh" | sha256sum -c - && OLLAMA_VERSION=${version} sh install.sh`;
+}
+
+/**
+ * LongMemory's built CLI and the stamp written after `pnpm build` (that build deletes dist first).
+ * @param {string} buildDir
+ */
+export function longMemoryCli(buildDir) {
+    return path.join(buildDir, "dist", "cli", "index.js");
+}
+
+/** @param {string} buildDir */
+export function longMemoryStamp(buildDir) {
+    return path.join(buildDir, "dist", `.${MARKER}-commit`);
+}
+
+/**
+ * How the service runner starts LongMemory: env file, then `serve`, no extra flags.
+ * The smoke test starts a candidate build with the same arguments.
+ * @param {string} node
+ * @param {string} envFile
+ * @param {string} cli
+ */
+export function longMemoryServeArgv(node, envFile, cli) {
+    return [node, `--env-file=${envFile}`, cli, "serve"];
 }
 
 /**
@@ -85,7 +142,8 @@ export function layout(platform = process.platform, home = os.homedir(), env = p
     const configDir = join(home, ".config", MARKER);
     const tools = join(share, "tools");
     const modulesDir = (root) => (platform === "win32" ? join(root, "node_modules") : join(root, "lib", "node_modules"));
-    const sourceDir = join(share, "LongMemory");
+    // Builds live under longmemory/builds/<sha>. The database stays beside that tree, not inside a build.
+    const longmemoryRoot = join(share, "longmemory");
     // OllamaSetup.exe installs to {localappdata}\\Programs\\Ollama (app/ollama.iss DefaultDirName).
     const ollamaWindowsDir = join(env.LOCALAPPDATA ?? join(home, "AppData", "Local"), "Programs", "Ollama");
     const xdgCache = env.XDG_CACHE_HOME;
@@ -113,11 +171,16 @@ export function layout(platform = process.platform, home = os.homedir(), env = p
         qmdPackage: join(modulesDir(prefix), "@tobilu", "qmd"),
         tools,
         pnpmPackage: join(modulesDir(tools), "pnpm"),
-        sourceDir,
-        buildStamp: join(sourceDir, "dist", `.${MARKER}-commit`),
+        longmemoryRoot,
+        buildsDir: join(longmemoryRoot, "builds"),
+        // Symlink to the running build on Linux and macOS. Windows has no equivalent the runner can follow, so it reads currentPointer.
+        currentLink: join(longmemoryRoot, "current"),
+        currentPointer: join(longmemoryRoot, "current.txt"),
+        // Directory of the build that was current before the last switch, and a marker that prune is still owed.
+        previousBuildFile: join(longmemoryRoot, "previous"),
+        switchMarker: join(longmemoryRoot, "switch-pending"),
         // Written when this setup installed QMD; only such a QMD is ever rebuilt.
         qmdInstallStamp: join(share, "qmd-install.json"),
-        cli: join(sourceDir, "dist", "cli", "index.js"),
         dbPath: join(share, "longmemory.db"),
         envPath: join(configDir, "longmemory.env"),
         choicesPath: join(configDir, "choices.json"),

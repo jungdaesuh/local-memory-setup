@@ -40,7 +40,7 @@ export const QMD_PACKAGE_BYTES = {
 };
 
 /**
- * LongMemory at the pinned commit:
+ * LongMemory build, an upper bound for the plan's download size:
  * - git clone: 6,222,035 (du of a full clone's .git)
  * - pnpm 11.5.2 tarball: 4,286,375 (registry.npmjs.org/pnpm/-/pnpm-11.5.2.tgz)
  * - `pnpm install --frozen-lockfile`: at most 533,927,351, the sum of the registry

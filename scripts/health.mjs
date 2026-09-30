@@ -2,7 +2,7 @@
  * What a healthy answer from each server looks like, so a different program on
  * the same port is not mistaken for it.
  * - QMD 2.5.3 GET /health: {"status":"ok","uptime":N} (dist/mcp/server.js)
- * - LongMemory 9ee2c8e1 GET /health: {"data":{"ok":true,...},"meta":{...}}
+ * - LongMemory GET /health: {"data":{"ok":true,...},"meta":{...}}
  *   (src/server/routes/health.ts, src/server/app.ts)
  * - Ollama GET /api/tags: {"models":[{"name":"bge-m3:latest",...}]}
  */

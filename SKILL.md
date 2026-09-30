@@ -15,7 +15,7 @@ The script prints one JSON document on stdout; progress goes to stderr.
 
 ## At session start: silent check
 
-Run `SCRIPT --check`. It changes nothing and never calls sudo.
+Run `SCRIPT --check`. It changes nothing, never calls sudo, and does not use the network. It reports whether the running LongMemory build is healthy.
 
 - Exit 0 and no output: everything is healthy. Say nothing about this skill.
 - Exit 3 with `"installed": false`: local memory has never been set up here. Start the
@@ -43,8 +43,9 @@ Run `SCRIPT --check`. It changes nothing and never calls sudo.
    - what starts again after a restart: on Linux with `bootMode` "boot", when the computer
      starts; otherwise when they log in. Ollama's own timing is in `detected.ollama.owner`
      (`system-unit` starts at boot);
-   - that everything stays on this computer: the servers listen only on this machine, and
-     the only network use is downloading the programs and models once;
+   - that everything stays on this computer: the servers listen only on this machine.
+     `--plan` looks up LongMemory's current `main` commit and shows `LongMemory main @ <short sha>`,
+     including whether that differs from the running build. The install downloads the programs and models;
    - that each connected agent gets short global instructions telling it when to recall
      and what to store (the `instructions-<agent>` actions).
 3. Ask ONE question with the agent's question tool (Claude Code: AskUserQuestion; Grok:
@@ -66,7 +67,7 @@ Run `SCRIPT --check`. It changes nothing and never calls sudo.
      `SCRIPT --apply --choices <that file>`.
    - **Not now**: do nothing, and do not ask again in this session.
 
-Never run `--apply` unless the user agreed in this chat.
+Never run `--apply` or `--update` unless the user agreed in this chat. `--update` resolves LongMemory's current `main` and runs only the LongMemory steps: build that commit into its own directory, smoke-test it, switch the `current` build, then restart the service. A failed smoke test or restart leaves the previous build running.
 
 ## Reading the apply result
 
@@ -108,7 +109,10 @@ the model size sets QMD's model only for a new index.
 ## Leave alone
 
 Do not install the npm package named `longmemory`: that is the old server. This skill builds
-LongMemory from pinned commit `9ee2c8e1ed42d83eb788afb9ffc3a82b84405da5`. Leave an existing
+LongMemory from the current `main` of https://github.com/CaviraOSS/LongMemory. Each commit
+gets its own directory; the memory database stays outside those directories. The running
+build is switched only after the new one passes its smoke test, and older builds are removed
+only after that switch (the current and previous builds are kept). Leave an existing
 OpenMemory server on port 8080 alone. The script itself leaves alone any QMD, LongMemory,
 or Ollama that is already running and was started by something else, and never replaces
 or downgrades an installed QMD.

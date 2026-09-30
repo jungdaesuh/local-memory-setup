@@ -27,9 +27,11 @@ test("the LongMemory settings pin 127.0.0.1, carry no key, and hold only variabl
 });
 
 test("the LongMemory runner unsets inherited settings, so the env file wins", { skip: process.platform === "win32" }, () => {
-    const text = longMemoryRunnerText({ node: "/usr/bin/node", L: layout("linux", "/home/a"), model: "bge-m3", platform: "linux" });
+    const L = layout("linux", "/home/a");
+    const text = longMemoryRunnerText({ node: "/usr/bin/node", L, model: "bge-m3", platform: "linux" });
     for (const key of LONGMEMORY_ENV_KEYS) assert.match(text, new RegExp(`^unset ${key}$`, "m"));
     assert.match(text, /'http:\/\/127\.0\.0\.1:11434\/api\/tags' 'bge-m3' '120' \|\| exit 1/);
+    assert.ok(text.includes(`exec '/usr/bin/node' '--env-file=${L.envPath}' '${L.currentLink}/dist/cli/index.js' 'serve'`));
     // Run the same shape: inherited settings, a host, or a key from the service manager must not reach the server.
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lms-runner-"));
     const script = path.join(dir, "r.sh");
@@ -38,6 +40,14 @@ test("the LongMemory runner unsets inherited settings, so the env file wins", { 
     const out = spawnSync("/bin/sh", [script], { encoding: "utf8", env: inherited });
     for (const name of ["LONGMEMORY_PORT", "LONGMEMORY_HOST", "LONGMEMORY_API_KEY", "OM_API_KEY"]) assert.doesNotMatch(out.stdout, new RegExp(`^${name}=`, "m"));
     assert.match(out.stdout, /^KEEP=1$/m);
+});
+
+test("the Windows LongMemory runner reads the current pointer before each serve", () => {
+    const L = layout("win32", "C:\\Users\\a");
+    const text = longMemoryRunnerText({ node: "C:\\node\\node.exe", L, model: "bge-m3", platform: "win32" });
+    assert.ok(text.includes(`set /p LONGMEMORY_BUILD=<"${L.currentPointer}"`));
+    assert.match(text, /"%LONGMEMORY_BUILD%\\dist\\cli\\index\.js" serve/);
+    assert.match(text, /--env-file=/);
 });
 
 test("the Ollama gate waits for the model, not only for the port", () => {

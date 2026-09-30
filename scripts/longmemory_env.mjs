@@ -1,6 +1,6 @@
 /**
  * LongMemory's settings file (~/.config/local-memory-setup/longmemory.env), read by
- * the server through `node --env-file`. Only variables LongMemory 9ee2c8e1 reads for
+ * the server through `node --env-file`. Only variables LongMemory reads for
  * `serve` are written: src/server/config.ts (host, port, key, MCP HTTP, database) and
  * src/core/embeddings/environment.ts (provider, tier, dimension, Ollama URL and model).
  * Project and user ids are not written: `serve` hardcodes tenant and user "default"
@@ -35,7 +35,7 @@ export function longMemorySettings(spec) {
  */
 export const LONGMEMORY_ENV_KEYS = [...longMemorySettings({ dbPath: "", model: "", dimension: 0 }).map(([key]) => key), "LONGMEMORY_API_KEY", "OM_API_KEY"];
 
-/** @param {readonly [string, string][]} settings */
+/** @param {readonly (readonly [string, string])[]} settings */
 export function renderEnvFile(settings) {
     for (const [key, value] of settings) if (/[\r\n]/.test(value)) throw new Error(`${key} cannot hold a line break.`);
     const header = [

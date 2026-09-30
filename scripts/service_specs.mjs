@@ -5,9 +5,9 @@
  */
 import path from "node:path";
 import { LONGMEMORY_ENV_KEYS } from "./longmemory_env.mjs";
-import { OLLAMA_HOST, OLLAMA_TAGS_URL, QMD_PORT } from "./layout.mjs";
+import { OLLAMA_HOST, OLLAMA_TAGS_URL, QMD_PORT, longMemoryCli, longMemoryServeArgv } from "./layout.mjs";
 import { QMD_GLOBAL_INDEX_ARGS, qmdEnvironment, qmdPathPrepend } from "./qmd_env.mjs";
-import { qmdDispatcher, runnerScript, shQuote } from "./service_files.mjs";
+import { longMemoryWindowsRunner, qmdDispatcher, runnerScript, shQuote } from "./service_files.mjs";
 
 /** @typedef {ReturnType<typeof import("./layout.mjs").layout>} Layout */
 /** @typedef {"nvidia" | "apple" | "other" | "none"} Gpu */
@@ -68,12 +68,25 @@ export function qmdRunnerText(spec) {
  * @param {{ node: string, L: Layout, model: string, platform: NodeJS.Platform }} spec
  */
 export function longMemoryRunnerText(spec) {
+    const env = LONGMEMORY_ENV_KEYS.map((key) => /** @type {const} */ ([key, null]));
+    const gate = [spec.node, path.join(spec.L.gateDir, GATE_FILES[0]), OLLAMA_TAGS_URL, spec.model, String(OLLAMA_GATE_SECONDS)];
+    // Windows reads the pointer on each start. Elsewhere the runner execs the symlink, so a restart follows a switched build without rewriting this script.
+    if (spec.platform === "win32") {
+        return longMemoryWindowsRunner({
+            node: spec.node,
+            envFile: spec.L.envPath,
+            pointer: spec.L.currentPointer,
+            env,
+            pathPrepend: path.dirname(spec.node),
+            gate,
+        });
+    }
     return runnerScript(
         {
-            env: LONGMEMORY_ENV_KEYS.map((key) => /** @type {const} */ ([key, null])),
+            env,
             pathPrepend: path.dirname(spec.node),
-            gate: [spec.node, path.join(spec.L.gateDir, GATE_FILES[0]), OLLAMA_TAGS_URL, spec.model, String(OLLAMA_GATE_SECONDS)],
-            argv: [spec.node, `--env-file=${spec.L.envPath}`, spec.L.cli, "serve"],
+            gate,
+            argv: longMemoryServeArgv(spec.node, spec.L.envPath, longMemoryCli(spec.L.currentLink)),
         },
         spec.platform,
     );

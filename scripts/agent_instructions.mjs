@@ -14,7 +14,7 @@
  * - Codex has no includes: the text goes inline, between markers, in the global file Codex
  *   reads ($CODEX_HOME/AGENTS.override.md when non-empty, else AGENTS.md).
  *
- * Tool names are those of LongMemory 9ee2c8e1 (src/mcp/tools, docs/mcp.md) and QMD 2.5.3
+ * Tool names are LongMemory's MCP tools (src/mcp/tools, docs/mcp.md) and QMD 2.5.3's
  * (dist/mcp/server.js), under the server names this setup registers: qmd, longmemory.
  */
 import { MARKER } from "./layout.mjs";
@@ -64,6 +64,12 @@ export function instructionsText() {
         "- Never store secrets, credentials, or the contents of .env files, in either server.",
         "",
     ].join("\n");
+}
+
+/** Tool names the instructions tell agents to call, in the order the text names them. */
+export function instructedLongMemoryTools() {
+    const named = instructionsText().match(/`longmemory_[a-z0-9_]+`/g) ?? [];
+    return [...new Set(named.map((token) => token.slice(1, -1)))];
 }
 
 /* ------------------------------------------------------------ Codex marker block */

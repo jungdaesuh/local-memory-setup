@@ -1,12 +1,13 @@
 /**
- * Local memory setup: QMD (search) and CaviraOSS LongMemory (memory, built from a
- * pinned commit; the npm package "longmemory" is the old HSG server), with Ollama
- * for LongMemory's embeddings, user services that restart, and agent MCP wiring.
+ * Local memory setup: QMD (search) and CaviraOSS LongMemory (memory, built from the
+ * current main of LONGMEMORY_REPO; the npm package "longmemory" is the old HSG server),
+ * with Ollama for LongMemory's embeddings, user services that restart, and agent MCP wiring.
  *
- *   node ensure.mjs [--check]              health check, no changes (default)
- *   node ensure.mjs --plan                 detect and print the install plan, no changes
+ *   node ensure.mjs [--check]              health check, no changes, no network (default)
+ *   node ensure.mjs --plan                 detect, resolve LongMemory main, print the plan; no changes
  *   node ensure.mjs --apply --choices F    run the plan's pending actions for choices file F
  *   node ensure.mjs --apply --yes          same, with the plan's recommended choices
+ *   node ensure.mjs --update               resolve main and run only the LongMemory actions
  *
  * stdout carries exactly one JSON document (none for a healthy --check).
  * Exit codes: 0 done or healthy, 1 failed or blocked, 2 needs an admin step, 3 unhealthy, 64 usage.
@@ -19,42 +20,45 @@ import { fileURLToPath } from "node:url";
 import { NeedsAdmin, runApply } from "./apply_loop.mjs";
 import { UsageError, parseArgs } from "./cli_args.mjs";
 import { RC_FILES, WINDOWS_USER_PATH_READ, detectAgents, detectFacts, ollamaBinary, ollamaSystemUnit, qmdEntryIn, setupNode } from "./detect.mjs";
+import { instructedLongMemoryTools } from "./agent_instructions.mjs";
 import { applyAgentInstructions } from "./instructions_apply.mjs";
 import { ollamaStartStep, rebuildCommand } from "./executor_steps.mjs";
 import { longMemoryHealthy, ollamaModelNames, qmdHealthy } from "./health.mjs";
 import {
-    LONGMEMORY_COMMIT,
     LONGMEMORY_HEALTH_URL,
     LONGMEMORY_MCP_URL,
     LONGMEMORY_REPO,
     MARKER,
     MIN_NODE,
     NOTES_README,
-    OLLAMA_INSTALL_SCRIPT_URL,
+    OLLAMA_INSTALL_SHA256,
     OLLAMA_PULL_URL,
     OLLAMA_TAGS_URL,
     OLLAMA_VERSION,
     QMD_HEALTH_URL,
-    ollamaAdminCommand,
     QMD_MCP_URL,
     QMD_VERSION,
     SERVICE_NAMES,
+    assertSha256Match,
+    fileSha256,
     layout,
+    ollamaAdminCommand,
+    ollamaInstallScriptUrl,
 } from "./layout.mjs";
-import { pinnedPnpmVersion } from "./longmemory_build.mjs";
+import { currentBuildDir, installLongMemoryCommit, pruneAfterSwitch, rollbackSwitch, runningLongMemory } from "./longmemory_build.mjs";
 import { longMemorySettings, renderEnvFile } from "./longmemory_env.mjs";
 import { appendServers, codexServers, grokServers, mcpAddArgs } from "./mcp_config.mjs";
 import { MODEL_TIERS } from "./model_choice.mjs";
 import { pullModelViaApi } from "./ollama_api.mjs";
 import { ollamaServicePlan } from "./ollama_plan.mjs";
-import { applyChoices, buildPlan, checkReport, effectiveQmdModels, foldersToAdd, newNotesFolder, planActions, startSummary, stepsNeedingNewerNode } from "./plan.mjs";
+import { applyChoices, buildPlan, checkReport, effectiveQmdModels, foldersToAdd, isLongMemoryAction, longMemoryRestartPending, newNotesFolder, planActions, startSummary, stepsNeedingNewerNode } from "./plan.mjs";
 import { binEntry } from "./platform.mjs";
 import { commandPath, probeJson, run, waitFor } from "./proc.mjs";
 import { QMD_GLOBAL_INDEX_ARGS, qmdProcessEnv } from "./qmd_env.mjs";
 import { writeUserFile } from "./fs_util.mjs";
 import { collectionNameFor, qmdCollections, writeQmdModelsIfAbsent } from "./qmd_state.mjs";
 import { launchAgentPlist, systemdUnit, windowsTaskXml, withManagedPathBlock } from "./service_files.mjs";
-import { LONGMEMORY_BUILD_BYTES, MCP_ADD_TIMEOUT_MS, OLLAMA_MODEL_BYTES, OLLAMA_ROCM_BYTES, QMD_PACKAGE_BYTES, downloadTimeoutMs, installTimeoutMs, ollamaInstallerBytes } from "./sizes.mjs";
+import { MCP_ADD_TIMEOUT_MS, OLLAMA_MODEL_BYTES, OLLAMA_ROCM_BYTES, QMD_PACKAGE_BYTES, downloadTimeoutMs, installTimeoutMs, ollamaInstallerBytes } from "./sizes.mjs";
 import { GATE_FILES, dispatcherText, longMemoryRunnerText, ollamaRunnerText, qmdRunnerText, rcPathLine, runnerFile } from "./service_specs.mjs";
 
 const L = layout();
@@ -189,7 +193,23 @@ function rebuildNative(component, ctx) {
     const pnpmJson = path.join(L.pnpmPackage, "package.json");
     const pnpmEntry = fs.existsSync(pnpmJson) ? path.join(L.pnpmPackage, binEntry(JSON.parse(fs.readFileSync(pnpmJson, "utf8")).bin, "pnpm")) : "";
     if (component === "longmemory" && pnpmEntry === "") throw new Error(`pnpm is missing from ${L.tools}; run the plan again to rebuild LongMemory.`);
-    const command = rebuildCommand(component, { L, nodeBin: ctx.node, npm: fs.existsSync(beside) ? beside : "npm", pnpmEntry, pathEnv: process.env.PATH ?? "", delimiter: path.delimiter });
+    /** @type {string} */
+    let sourceDir;
+    if (component === "longmemory") {
+        const dir = currentBuildDir(L, platform);
+        if (dir === null) throw new Error("LongMemory has no current build to rebuild.");
+        sourceDir = dir;
+    } else {
+        sourceDir = L.qmdPackage;
+    }
+    const command = rebuildCommand(component, {
+        L: { qmdPackage: L.qmdPackage, sourceDir },
+        nodeBin: ctx.node,
+        npm: fs.existsSync(beside) ? beside : "npm",
+        pnpmEntry,
+        pathEnv: process.env.PATH ?? "",
+        delimiter: path.delimiter,
+    });
     run(command.command, command.args, { cwd: command.cwd, env: { ...process.env, CI: "1", PATH: command.pathEnv }, stream: true, timeoutMs: installTimeoutMs(0) });
     if (ctx.facts.services[component]) restartService(component);
 }
@@ -219,31 +239,21 @@ const EXECUTORS = {
     "rebuild-qmd": async (ctx) => rebuildNative("qmd", ctx),
     "rebuild-longmemory": async (ctx) => rebuildNative("longmemory", ctx),
 
-    "install-longmemory": async ({ node }) => {
-        fs.mkdirSync(L.share, { recursive: true });
-        if (!fs.existsSync(path.join(L.sourceDir, ".git"))) run("git", ["clone", LONGMEMORY_REPO, L.sourceDir], { stream: true, timeoutMs: downloadTimeoutMs(LONGMEMORY_BUILD_BYTES) });
-        const head = run("git", ["-C", L.sourceDir, "rev-parse", "HEAD"]).stdout.trim();
-        if (head !== LONGMEMORY_COMMIT) {
-            if (run("git", ["-C", L.sourceDir, "status", "--porcelain"]).stdout.trim()) {
-                throw new Error(`${L.sourceDir} has local changes. Move it aside and apply again.`);
-            }
-            if (run("git", ["-C", L.sourceDir, "cat-file", "-e", `${LONGMEMORY_COMMIT}^{commit}`], { allowFail: true }).status !== 0) {
-                run("git", ["-C", L.sourceDir, "fetch", "origin", LONGMEMORY_COMMIT], { stream: true, timeoutMs: downloadTimeoutMs(LONGMEMORY_BUILD_BYTES) });
-            }
-            run("git", ["-C", L.sourceDir, "checkout", "--detach", LONGMEMORY_COMMIT], { stream: true });
-        }
-        const pnpmVersion = pinnedPnpmVersion(fs.readFileSync(path.join(L.sourceDir, "package.json"), "utf8"));
-        const pnpmJson = path.join(L.pnpmPackage, "package.json");
-        if (!fs.existsSync(pnpmJson) || JSON.parse(fs.readFileSync(pnpmJson, "utf8")).version !== pnpmVersion) {
-            run("npm", ["install", "-g", "--prefix", L.tools, `pnpm@${pnpmVersion}`], { stream: true, timeoutMs: downloadTimeoutMs(LONGMEMORY_BUILD_BYTES) });
-        }
-        const pnpm = path.join(L.pnpmPackage, binEntry(JSON.parse(fs.readFileSync(pnpmJson, "utf8")).bin, "pnpm"));
-        const env = { ...process.env, CI: "1", PATH: `${path.dirname(node)}${path.delimiter}${process.env.PATH ?? ""}` };
-        run(node, [pnpm, "install", "--frozen-lockfile"], { cwd: L.sourceDir, env, stream: true, timeoutMs: installTimeoutMs(LONGMEMORY_BUILD_BYTES) });
-        run(node, [pnpm, "build"], { cwd: L.sourceDir, env, stream: true, timeoutMs: installTimeoutMs(0) });
-        if (!fs.existsSync(L.cli)) throw new Error(`LongMemory build did not produce ${L.cli}.`);
-        // `pnpm build` deletes dist first, so the stamp marks only a build that finished.
-        writeIfChanged(L.buildStamp, `${LONGMEMORY_COMMIT}\n`);
+    "install-longmemory": async ({ node, facts, choices }) => {
+        const sha = facts.longmemory.main;
+        if (sha === undefined) throw new Error("LongMemory main was not resolved; run the plan again.");
+        const tier = MODEL_TIERS[choices.modelTier].longmemory;
+        await installLongMemoryCommit({
+            sha,
+            node,
+            repo: LONGMEMORY_REPO,
+            platform,
+            settings: longMemorySettings({ dbPath: L.dbPath, model: tier.model, dimension: tier.dimension }),
+            tools: instructedLongMemoryTools(),
+            // The following start step restarts our service and prunes only after that succeeds.
+            deferPrune: longMemoryRestartPending(facts),
+            L,
+        });
     },
 
     "install-ollama": async ({ facts }) => {
@@ -252,9 +262,11 @@ const EXECUTORS = {
         const timeoutMs = installTimeoutMs(ollamaInstallerBytes(platform, facts.arch) + (platform === "linux" ? OLLAMA_ROCM_BYTES : 0));
         if (platform === "linux") {
             // Downloaded to a file first, so a failed download fails here instead of feeding sh an empty script.
-            const script = path.join(L.share, "downloads", "ollama-install.sh");
+            const script = path.join(L.share, "downloads", "install.sh");
             fs.mkdirSync(path.dirname(script), { recursive: true });
-            run("curl", ["-fsSL", "-o", script, OLLAMA_INSTALL_SCRIPT_URL], { stream: true, timeoutMs: downloadTimeoutMs(0) });
+            run("curl", ["-fsSL", "-o", script, ollamaInstallScriptUrl(OLLAMA_VERSION)], { stream: true, timeoutMs: downloadTimeoutMs(0) });
+            // Checked before sudo, so a mismatched file is never run as root.
+            assertSha256Match(fileSha256(script), OLLAMA_INSTALL_SHA256);
             requireSudo("Installing Ollama needs the admin password.", ollamaAdminCommand(OLLAMA_VERSION));
             // As root, so install.sh's own sudo calls cannot prompt midway; OLLAMA_VERSION pins the release.
             run("sudo", ["-n", "env", `OLLAMA_VERSION=${OLLAMA_VERSION}`, "sh", script], { stream: true, timeoutMs });
@@ -355,14 +367,37 @@ const EXECUTORS = {
         await waitFor("QMD", async () => qmdHealthy(await probeJson(QMD_HEALTH_URL)), 60);
     },
 
-    "start-longmemory": async ({ choices, node }) => {
+    "start-longmemory": async ({ choices, node, facts }) => {
         const gateChanged = GATE_FILES.map((name) => writeIfChanged(path.join(L.gateDir, name), fs.readFileSync(path.join(SCRIPTS_DIR, name)))).some(Boolean);
         const model = MODEL_TIERS[choices.modelTier].longmemory.model;
         const runnerChanged = writeRunner("longmemory", longMemoryRunnerText({ node, L, model, platform }));
         const ownOllamaUnit = platform === "linux" && ollamaServicePlan({ platform, systemUnitLoaded: ollamaSystemUnit().loaded }).owner === "skill" && fs.existsSync(path.join(L.systemdUserDir, SERVICE_NAMES.ollama.systemd));
-        registerService("longmemory", runnerChanged || gateChanged, ownOllamaUnit ? [SERVICE_NAMES.ollama.systemd] : []);
-        // The runner's gate may wait up to 120 s for Ollama before LongMemory starts.
-        await waitFor("LongMemory", async () => longMemoryHealthy(await probeJson(LONGMEMORY_HEALTH_URL)), 150);
+        // A switch leaves the runner path the same (it execs `current`), so the unit must still restart.
+        const switched = fs.existsSync(L.switchMarker);
+        const sha = facts.longmemory.main ?? "unknown";
+        try {
+            registerService("longmemory", runnerChanged || gateChanged || switched, ownOllamaUnit ? [SERVICE_NAMES.ollama.systemd] : []);
+            // The runner's gate may wait up to 120 s for Ollama before LongMemory starts.
+            await waitFor("LongMemory", async () => longMemoryHealthy(await probeJson(LONGMEMORY_HEALTH_URL)), 150);
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            const previous = rollbackSwitch(L, platform);
+            if (previous !== null) {
+                try {
+                    restartService("longmemory");
+                } catch (rollbackError) {
+                    const extra = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+                    throw new Error(`LongMemory ${sha} failed the restart check: ${detail} Rolling back to the previous build also failed: ${extra}`);
+                }
+            }
+            throw new Error(`LongMemory ${sha} failed the restart check: ${detail}`);
+        }
+        try {
+            pruneAfterSwitch(L, platform);
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            throw new Error(`LongMemory ${sha} is running, but removing older builds failed: ${detail}`);
+        }
     },
 
     "connect-claude": async () => connectCli("claude"),
@@ -448,25 +483,34 @@ function connectToml(file, servers) {
 
 /* ---------------------------------------------------------------- modes */
 
-async function apply(yes, choicesFile) {
-    const facts = await detectFacts(L, { probeAdmin: true });
+/**
+ * @param {boolean} yes
+ * @param {string | undefined} choicesFile
+ * @param {boolean} updateOnly resolve main and run only the LongMemory actions; do not save choices
+ */
+async function apply(yes, choicesFile, updateOnly) {
+    const facts = await detectFacts(L, { probeAdmin: true, resolveMain: true });
     const plan = buildPlan(facts);
     const requested = applyChoices(plan, yes ? null : JSON.parse(fs.readFileSync(/** @type {string} */ (choicesFile), "utf8")));
     // Only folders QMD does not index yet must exist; an indexed folder that moved does not block a repair.
+    // A LongMemory-only update does not touch those folders.
     const toAdd = foldersToAdd(requested, facts.qmd.collectionPaths);
-    // The default notes folder is created by index-folders; every other new folder must exist.
-    const notesToCreate = newNotesFolder(facts, requested);
-    const missingFolders = toAdd.filter((folder) => folder !== notesToCreate && (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()));
-    if (missingFolders.length > 0) throw new Error(`These folders do not exist: ${missingFolders.join(", ")}`);
+    const notesToCreate = updateOnly ? null : newNotesFolder(facts, requested);
+    if (!updateOnly) {
+        const missingFolders = toAdd.filter((folder) => folder !== notesToCreate && (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()));
+        if (missingFolders.length > 0) throw new Error(`These folders do not exist: ${missingFolders.join(", ")}`);
+    }
     // QMD stores a collection under its real path (qmd.js collection add: getRealPath); the
     // notes folder to create takes its parent's real path.
     const realFolder = (/** @type {string} */ folder) =>
         folder === notesToCreate ? path.join(fs.realpathSync(path.dirname(folder)), path.basename(folder)) : fs.realpathSync(folder);
-    const folders = requested.qmdFolders.map((folder) => (toAdd.includes(folder) ? realFolder(folder) : folder));
-    if (new Set(folders).size !== folders.length) throw new Error("Two qmdFolders entries are the same folder.");
+    const folders = updateOnly ? requested.qmdFolders : requested.qmdFolders.map((folder) => (toAdd.includes(folder) ? realFolder(folder) : folder));
+    if (!updateOnly && new Set(folders).size !== folders.length) throw new Error("Two qmdFolders entries are the same folder.");
     const choices = { ...requested, qmdFolders: folders };
 
-    const pending = planActions(facts, choices).filter((action) => !action.alreadyDone);
+    const pending = planActions(facts, choices)
+        .filter((action) => !action.alreadyDone)
+        .filter((action) => !updateOnly || isLongMemoryAction(action.id));
     const blockers = pending.flatMap((action) => (action.blocker === null ? [] : [action.blocker]));
     if (blockers.length > 0) throw new Blocked(blockers);
     // One Node for every generated script and build: the recorded one while it is usable, else this one.
@@ -505,16 +549,21 @@ async function apply(yes, choicesFile) {
             await EXECUTORS[action.id](ctx);
         },
         remainingAfter: async () =>
-            planActions(await detectFacts(L, { probeAdmin: false }), choices)
+            planActions(await detectFacts(L, { probeAdmin: false, resolveMain: false }), choices)
                 .filter((action) => !action.alreadyDone)
+                .filter((action) => !updateOnly || isLongMemoryAction(action.id))
                 .map((action) => ({ id: action.id, problem: action.blocker ?? action.problem })),
-        persist: () => writeIfChanged(L.choicesPath, `${JSON.stringify(choices, null, 2)}\n`),
+        persist: updateOnly ? () => {} : () => writeIfChanged(L.choicesPath, `${JSON.stringify(choices, null, 2)}\n`),
     });
     if (deferred.length > 0) {
         throw new NeedsAdmin(
             `Everything else is set up and running. ${deferred.map((error) => error.message).join(" ")}`,
             deferred.flatMap((error) => error.commands),
         );
+    }
+    if (updateOnly) {
+        emit({ status: "ready", updated: "longmemory", commit: runningLongMemory(L, platform)?.commit ?? null, longmemory: LONGMEMORY_MCP_URL });
+        return;
     }
     const tier = MODEL_TIERS[choices.modelTier];
     emit({
@@ -533,16 +582,20 @@ async function apply(yes, choicesFile) {
 async function main() {
     const { mode, yes, choicesFile } = parseArgs(process.argv.slice(2));
     if (mode === "--plan") {
-        emit(buildPlan(await detectFacts(L, { probeAdmin: true })));
+        emit(buildPlan(await detectFacts(L, { probeAdmin: true, resolveMain: true })));
         return 0;
     }
     if (mode === "--check") {
-        const report = checkReport(await detectFacts(L, { probeAdmin: false }));
+        const report = checkReport(await detectFacts(L, { probeAdmin: false, resolveMain: false }));
         if (report.healthy) return 0;
         emit(report);
         return 3;
     }
-    await apply(yes, choicesFile);
+    if (mode === "--update") {
+        await apply(true, undefined, true);
+        return 0;
+    }
+    await apply(yes, choicesFile, false);
     return 0;
 }
 
