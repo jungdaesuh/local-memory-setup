@@ -23,16 +23,16 @@ It works with **Claude Code, Codex, Grok and OpenCode** on **Linux, macOS and Wi
 
 3. Start a new session. The agent explains what it will install and asks two things:
    - **Which model size?** *Small*, *Medium* or *Large*. One size sets both the note-search
-     and the agent-memory model; the agent recommends the one that fits your computer and
-     says why.
-   - **Install now?** *Yes*, *Customize* (choose agents, folders, and start at boot or login),
-     or *Not now*.
+     and the agent-memory model (an existing QMD index keeps its own search model); the
+     agent recommends the one that fits your computer and says why.
+   - **Install now?** *Yes*, *Customize* (choose agents, folders, and on Linux whether to start
+     at boot or at login), or *Not now*.
 
 That's it. Nothing is installed until you say yes.
 
 ## What you get
 
-- The three servers start automatically after a reboot or crash.
+- The three servers start again automatically when you log in (on Linux, optionally at boot) and restart if they crash.
 - Your agents are connected to them, with short instructions on when to recall and what to save.
 - A `~/notes` folder that QMD indexes, if you don't have an index yet.
 - Models sized to your hardware, all free and local.
@@ -52,8 +52,8 @@ The agent runs these for you, but you can run them yourself from this folder:
 
 ## Good to know
 
-- **Local only.** Nothing leaves your machine. The servers listen on `localhost` only.
-- **Existing installs are respected.** If you already have QMD, Ollama or agent settings, the setup uses them and doesn't overwrite them.
+- **Local only.** Your notes and memories stay on your machine; the servers listen on `localhost` only. Setup itself downloads the programs and models.
+- **Existing installs are respected.** If you already have QMD, Ollama or agent settings, the setup uses them and doesn't overwrite them. If an existing version can't be used, it stops and explains why instead of replacing it.
 - **First search is slow.** QMD downloads its search models the first time it needs them.
 - **Admin password.** On Linux, installing Ollama and starting at boot need it once. The setup never waits for a password prompt; it prints the exact command to run instead.
 - **LongMemory updates safely.** A new version is tested before it replaces the running one. Your memories are kept.

@@ -23,9 +23,11 @@ Include the affected file and line, the platform, and steps to reproduce.
   validates the `Host` header. A malicious web page that rebinds its own domain
   to `127.0.0.1` could read or write memories and read indexed notes while the
   page is open. QMD's behavior is upstream; LongMemory's is a deliberate choice
-  for a keyless local setup. If this matters on your machine, set
-  `LONGMEMORY_API_KEY` for the LongMemory service and pass it as `X-API-Key`
-  in your agents' MCP settings.
+  for a keyless local setup. The setup has no option to add a key: its service
+  runner clears `LONGMEMORY_API_KEY`, and a key added by hand to
+  `~/.config/local-memory-setup/longmemory.env` is removed the next time the
+  setup writes its settings. If this risk matters on your machine, do
+  not visit untrusted sites while the servers run, or stop the LongMemory service.
 - **LongMemory tracks upstream `main`.** Each install or `--update` builds the
   latest commit of `CaviraOSS/LongMemory`. A new build must pass a smoke test
   before it replaces the running one, but a commit that passes can still change

@@ -49,7 +49,9 @@ Run `SCRIPT --check`. It changes nothing, never calls sudo, and does not use the
    - that each connected agent gets short global instructions telling it when to recall
      and what to store (the `instructions-<agent>` actions).
 3. Explain the model size. One size sets both the note-search model (QMD) and the
-   agent-memory model (LongMemory). In plain words, never by model name:
+   agent-memory model (LongMemory), with one exception: when `detected.qmd.configModels`
+   is not null, QMD already has an index with its own models, which it keeps; then say
+   the size changes only the agent-memory model. In plain words, never by model name:
    - what the recommended size (`recommended.modelTier`) means, and why it fits this
      computer: say the memory in `hardware.ramBytes` (GB) and the graphics memory in
      `hardware.vramBytes`, or that it is an Apple Silicon Mac (`hardware.appleSilicon`);
